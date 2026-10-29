@@ -617,11 +617,15 @@ class WaveFlixProvider : MainAPI() {
                         return false
                     }
 
-                    // Search across NetMirror Prime (pv) & OTT endpoints
-                    val ottEngines = listOf("pv")
+                    // Search across NetMirror Prime (pv), Netflix (nf), and Disney/Hotstar (hs)
+                    val ottEngines = listOf("pv", "nf", "hs")
                     for (ott in ottEngines) {
                         try {
-                            val searchUrl = "https://net52.cc/mobile/$ott/search.php?s=${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                            val searchUrl = if (ott == "nf") {
+                                "https://net52.cc/mobile/search.php?s=${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                            } else {
+                                "https://net52.cc/mobile/$ott/search.php?s=${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                            }
                             val searchRes = app.get(searchUrl, headers = NetMirrorResolver.baseHeaders, timeout = 6).text
                             val searchData = tryParseJson<NetMirrorSearchResponse>(searchRes)
                             val items = searchData?.searchResult ?: emptyList()
@@ -645,7 +649,32 @@ class WaveFlixProvider : MainAPI() {
                             }
 
                             if (match?.id != null) {
-                                if (tryPlayer(match.id, ott)) break
+                                var playId = match.id
+                                // For TV Series, resolve target episode ID from episodes.php
+                                if (!isMovie && episode != null) {
+                                    try {
+                                        val epUrl = if (ott == "nf") {
+                                            "https://net52.cc/mobile/episodes.php?s=${match.id}"
+                                        } else {
+                                            "https://net52.cc/mobile/$ott/episodes.php?s=${match.id}"
+                                        }
+                                        val epRes = app.get(epUrl, headers = NetMirrorResolver.baseHeaders, timeout = 6).text
+                                        val epData = tryParseJson<NetMirrorEpisodeResponse>(epRes)
+                                        val epList = epData?.episodes ?: emptyList()
+                                        val epTarget = epList.firstOrNull { epItem ->
+                                            val sVal = epItem.s?.replace("S", "", ignoreCase = true)?.trim()
+                                            val eVal = epItem.ep?.replace("E", "", ignoreCase = true)?.trim()
+                                            eVal == episode.toString() && (season == null || sVal == season.toString())
+                                        } ?: epList.firstOrNull { epItem ->
+                                            val eVal = epItem.ep?.replace("E", "", ignoreCase = true)?.trim()
+                                            eVal == episode.toString()
+                                        }
+                                        if (epTarget?.id != null) {
+                                            playId = epTarget.id
+                                        }
+                                    } catch (_: Throwable) {}
+                                }
+                                if (tryPlayer(playId, ott)) break
                             }
                         } catch (_: Throwable) {}
                     }
@@ -2363,6 +2392,19 @@ class WaveFlixProvider : MainAPI() {
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class NetMirrorSearchResponse(
         @JsonProperty("searchResult") val searchResult: List<NetMirrorSearchResultItem>? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NetMirrorEpisodeResponse(
+        @JsonProperty("episodes") val episodes: List<NetMirrorEpisodeItem>? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NetMirrorEpisodeItem(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("t") val t: String? = null,
+        @JsonProperty("s") val s: String? = null,
+        @JsonProperty("ep") val ep: String? = null
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
