@@ -3,6 +3,7 @@ package com.lagradost
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
+import android.content.Context
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Handler
@@ -48,6 +49,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -59,8 +61,54 @@ class AnimePaheProvider : MainAPI() {
         const val USER_AGENT =
             "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
 
+        private const val PREFS_NAME = "animepahe_cf_prefs"
+        private const val KEY_CF_COOKIES = "cf_cookies"
+        private const val KEY_CF_UA = "cf_user_agent"
+        private const val KEY_CF_TS = "cf_timestamp"
+
         var cfCookies: String? = null
         var cfUserAgent: String? = null
+
+        fun loadSavedSession(context: Context? = null) {
+            if (cfCookies != null && cfUserAgent != null) return
+            val ctx = context ?: CommonActivity.activity ?: getActivity() ?: return
+            runCatching {
+                val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val savedCookies = prefs.getString(KEY_CF_COOKIES, null)
+                val savedUa = prefs.getString(KEY_CF_UA, null)
+                if (!savedCookies.isNullOrBlank() && extractClearanceToken(savedCookies) != null) {
+                    cfCookies = savedCookies
+                }
+                if (!savedUa.isNullOrBlank()) {
+                    cfUserAgent = savedUa
+                }
+            }
+        }
+
+        fun saveSession(context: Context? = null, cookies: String, ua: String?) {
+            cfCookies = cookies
+            if (!ua.isNullOrBlank()) {
+                cfUserAgent = ua
+            }
+            val ctx = context ?: CommonActivity.activity ?: getActivity() ?: return
+            runCatching {
+                val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit()
+                    .putString(KEY_CF_COOKIES, cookies)
+                    .putString(KEY_CF_UA, cfUserAgent)
+                    .putLong(KEY_CF_TS, System.currentTimeMillis())
+                    .apply()
+            }
+        }
+
+        fun clearSavedSession(context: Context? = null) {
+            cfCookies = null
+            val ctx = context ?: CommonActivity.activity ?: getActivity() ?: return
+            runCatching {
+                val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit().remove(KEY_CF_COOKIES).remove(KEY_CF_TS).apply()
+            }
+        }
 
         private val cfMutex = Mutex()
         private var lastCfDialogAtMs = 0L
@@ -113,6 +161,9 @@ class AnimePaheProvider : MainAPI() {
         }
 
         fun getHeaders(base: String = MAIN_URL): Map<String, String> {
+            if (cfCookies == null || cfUserAgent == null) {
+                loadSavedSession()
+            }
             if (cfUserAgent == null) {
                 val act = CommonActivity.activity ?: getActivity()
                 if (act != null) {
@@ -224,6 +275,9 @@ class AnimePaheProvider : MainAPI() {
 
 
         fun syncCookiesToApp(appInstance: Requests, base: String = MAIN_URL) {
+            if (cfCookies == null) {
+                loadSavedSession()
+            }
             val cookies = cfCookies ?: runCatching {
                 CookieManager.getInstance().getCookie(base)
             }.getOrNull() ?: return
@@ -274,6 +328,7 @@ class AnimePaheProvider : MainAPI() {
         }
 
         fun purgeCfState(appInstance: Requests) {
+            clearSavedSession()
             cfCookies = null
             runCatching { appInstance.baseClient.connectionPool.evictAll() }
             val cookieManager = runCatching { CookieManager.getInstance() }.getOrNull()
@@ -444,6 +499,17 @@ class AnimePaheProvider : MainAPI() {
                         }
                     }
 
+                    // Start dialog window with 0 alpha so non-interactive Turnstile completes invisibly
+                    dialog.window?.decorView?.alpha = 0f
+
+                    val revealDialogRunnable = Runnable {
+                        if (!cookiesSaved && dialog.isShowing) {
+                            runCatching {
+                                dialog.window?.decorView?.animate()?.alpha(1f)?.setDuration(250L)?.start()
+                            }
+                        }
+                    }
+
                     val root = LinearLayout(activity).apply {
                         orientation = LinearLayout.VERTICAL
                         setBackgroundColor(Color.parseColor("#121218"))
@@ -556,9 +622,10 @@ class AnimePaheProvider : MainAPI() {
                         if (cookiesSaved) return
                         cookiesSaved = true
 
+                        handler.removeCallbacks(revealDialogRunnable)
                         cookieManager.flush()
-                        cfCookies = cookies
-                        cfUserAgent = webView.settings.userAgentString
+                        val ua = webView.settings.userAgentString
+                        saveSession(activity, cookies, ua)
                         syncCookiesToApp(appInstance)
 
                         val extractScript = """
@@ -652,6 +719,7 @@ class AnimePaheProvider : MainAPI() {
 
                     dialog.setOnDismissListener {
                         handler.removeCallbacks(cookiePollRunnable)
+                        handler.removeCallbacks(revealDialogRunnable)
                         isDialogShowing.set(false)
                         if (!cookiesSaved) {
                             val finalTitle = webView.title ?: ""
@@ -670,7 +738,8 @@ class AnimePaheProvider : MainAPI() {
 
                     dialog.show()
                     webView.loadUrl(targetUrl)
-                    handler.postDelayed(cookiePollRunnable, 1000L)
+                    handler.postDelayed(cookiePollRunnable, 600L)
+                    handler.postDelayed(revealDialogRunnable, 2500L)
 
                 } catch (e: Throwable) {
                     Log.e("AnimePahe", "Failed in solveCloudflare: ${e.message}")
@@ -712,6 +781,14 @@ class AnimePaheProvider : MainAPI() {
 
     private suspend fun fetchWithCloudflare(url: String, allowDialog: Boolean = true): String {
         Log.d("AnimePahe", "fetchWithCloudflare: GET $url")
+        // 0. Ensure persistent session is loaded and synced to OkHttp
+        if (cfCookies == null) {
+            loadSavedSession()
+            if (cfCookies != null) {
+                syncCookiesToApp(app)
+            }
+        }
+
         // 1. Fast check with active cookies (OkHttp)
         val initial = runCatching { app.get(url, headers = getHeaders()) }.getOrNull()
         if (initial != null && !isBlocked(initial)) {
@@ -728,8 +805,11 @@ class AnimePaheProvider : MainAPI() {
                 return@withLock recheck.text
             }
 
-            Log.w("AnimePahe", "Purging stale CF state and initiating solve...")
-            purgeCfState(app)
+            // Only purge if the server explicitly blocked us with a Cloudflare challenge
+            if (initial != null && isBlocked(initial)) {
+                Log.w("AnimePahe", "Purging stale CF state and initiating solve...")
+                purgeCfState(app)
+            }
 
             val solveTarget = if (url.contains("animepahe.pw/api")) url else "$MAIN_URL/api?m=airing&page=1"
             val res = solveCloudflare(app, solveTarget, allowDialog = allowDialog)
@@ -1266,20 +1346,40 @@ class AnimePaheProvider : MainAPI() {
 
     // ── Kwik Stream Unpacker ──────────────────────────────────────────
     private suspend fun getStreamUrlFromKwik(kwikUrl: String): String? {
-        val response = runCatching {
-            app.get(
-                kwikUrl,
-                headers = mapOf(
-                    "User-Agent" to (cfUserAgent ?: USER_AGENT),
-                    "Referer" to "$mainUrl/"
+        val maxRetries = 3
+        for (attempt in 0 until maxRetries) {
+            val res = runCatching {
+                app.get(
+                    kwikUrl,
+                    headers = mapOf(
+                        "User-Agent" to (cfUserAgent ?: USER_AGENT),
+                        "Referer" to "$mainUrl/"
+                    )
                 )
-            ).text
-        }.getOrNull() ?: return null
+            }.getOrNull()
 
-        val unpacked = getAndUnpack(response)
-        return Regex("""source\s*=\s*['"]([^'"]+)['"]""").find(unpacked)?.groupValues?.get(1)
-            ?: Regex("""(?:https?://[^\s'"<>]+\.(?:mp4|m3u8)[^\s'"<>]*)""").find(unpacked)?.value
-            ?: Regex("""url\s*:\s*['"]([^'"]+\.(?:mp4|m3u8)[^'"]*)['"]""").find(unpacked)?.groupValues?.get(1)
+            if (res != null) {
+                if (res.code == 429) {
+                    val delayMs = 600L * (1L shl attempt) + (50L..200L).random()
+                    Log.w("AnimePahe", "Kwik rate limited (429) on $kwikUrl. Retrying in ${delayMs}ms...")
+                    delay(delayMs)
+                    continue
+                }
+                if (res.code in 200..299) {
+                    val unpacked = getAndUnpack(res.text)
+                    val stream = Regex("""source\s*=\s*['"]([^'"]+)['"]""").find(unpacked)?.groupValues?.get(1)
+                        ?: Regex("""(?:https?://[^\s'"<>]+\.(?:mp4|m3u8)[^\s'"<>]*)""").find(unpacked)?.value
+                        ?: Regex("""url\s*:\s*['"]([^'"]+\.(?:mp4|m3u8)[^'"]*)['"]""").find(unpacked)?.groupValues?.get(1)
+                    if (!stream.isNullOrBlank()) {
+                        return stream
+                    }
+                }
+            }
+            if (attempt < maxRetries - 1) {
+                delay(350L + (50L..150L).random())
+            }
+        }
+        return null
     }
 
     // ── Load Links ────────────────────────────────────────────────────
