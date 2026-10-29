@@ -1,10 +1,10 @@
 [
     {
         "iconUrl": "https://raw.githubusercontent.com/Adiversion/csext/builds/AnimePahe_icon.png",
-        "fileHash": "sha256-641ee8de18b914faf05803ad5f92a312610baf17f6232343dfcc57c0609d5e3b",
+        "fileHash": "sha256-a9a9ba82a6552e894e01505dbeb8574082bb47793df97f32a2737ce0fd62e4ea",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Adiversion/csext",
-        "fileSize": 70698,
+        "fileSize": 73777,
         "status": 1,
         "language": "en",
         "authors": [
@@ -15,7 +15,7 @@
             "Anime",
             "OVA"
         ],
-        "version": 78,
+        "version": 79,
         "internalName": "AnimePaheProvider",
         "description": "AnimePahe anime provider with interactive Cloudflare Turnstile verification and Kwik resolvers.",
         "url": "https://raw.githubusercontent.com/Adiversion/csext/builds/AnimePaheProvider.cs3",
