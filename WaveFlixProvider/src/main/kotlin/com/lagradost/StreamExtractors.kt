@@ -1105,7 +1105,8 @@ data class VidboltStream(
 data class VidboltSource(
     @JsonProperty("url") val url: String? = null,
     @JsonProperty("quality") val quality: String? = null,
-    @JsonProperty("kind") val kind: String? = null
+    @JsonProperty("kind") val kind: String? = null,
+    @JsonProperty("language") val language: String? = null
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -1160,16 +1161,36 @@ open class VidboltExtractor : ExtractorApi() {
                         val stream = json?.stream ?: return@runCatching
                         val srvName = stream.server?.replaceFirstChar { it.uppercase() } ?: srv.replaceFirstChar { it.uppercase() }
 
+                        val hasHls = stream.sources?.any { it.kind?.lowercase() == "hls" || it.url?.contains(".m3u8") == true } == true
+
                         stream.sources?.forEach { src ->
                             val sUrl = src.url?.trim() ?: return@forEach
                             val qLabel = src.quality ?: "Auto"
                             val isHls = src.kind?.lowercase() == "hls" || sUrl.contains(".m3u8")
+                            val rawLang = src.language?.trim() ?: ""
+                            val lowerLang = rawLang.lowercase()
+
+                            // If this server already provides an adaptive multi-audio HLS stream,
+                            // skip single-language foreign dubbed MP4s (e.g. Russian sub, Arabic sub, Italian, Spanish, Portuguese)
+                            // Only include HLS or explicit Hindi/English/Dual-Audio streams
+                            if (hasHls && !isHls) {
+                                val isPreferredAudio = lowerLang.contains("hindi") || lowerLang.contains("english") ||
+                                                       lowerLang.contains("orig") || lowerLang.contains("dual") ||
+                                                       lowerLang.contains("multi")
+                                if (!isPreferredAudio) return@forEach
+                            }
+
                             val qInt = parseStreamQuality(qLabel)
+                            val audioLabel = when {
+                                isHls -> "[Multi-Audio ⚡ Direct]"
+                                rawLang.isNotBlank() -> "[$rawLang]"
+                                else -> "[Direct]"
+                            }
 
                             callback(
                                 newExtractorLink(
                                     source = name,
-                                    name = "$name [$srvName] - $qLabel [Multi-Audio ⚡ Direct]",
+                                    name = "$name [$srvName] - $qLabel $audioLabel",
                                     url = sUrl,
                                     type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                 ) {

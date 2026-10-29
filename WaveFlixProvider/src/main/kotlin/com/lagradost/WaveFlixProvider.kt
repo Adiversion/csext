@@ -235,6 +235,7 @@ class WaveFlixProvider : MainAPI() {
         // Self-Healing Link Interceptor: filters unplayable containers (3003) & dead streams before ExoPlayer ever sees them
         val seenUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val seenFileKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val seenLinkKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
         val selfHealingCallback: (ExtractorLink) -> Unit = { link ->
             val rawUrl = link.url.trim()
@@ -255,7 +256,12 @@ class WaveFlixProvider : MainAPI() {
                                 lower.contains("tinyurl.com")
 
             // 3. Deduplication: Prevent flooding the player queue with identical dead links & duplicate worker mirrors
-            val isExactDuplicate = !seenUrls.add(rawUrl)
+            // Strip dynamic signed query parameters (AWS S3 CloudFront Policy/Signature/Key-Pair-Id, token timestamps)
+            val cleanUrlKey = rawUrl.substringBefore("&Policy=")
+                .substringBefore("&Signature=")
+                .substringBefore("?token=")
+                .substringBefore("&token=")
+            val isExactDuplicate = !seenUrls.add(cleanUrlKey)
 
             // Check media file duplication across mirrors (e.g. 4 workers serving the exact same MKV file)
             val fileName = rawUrl.substringAfterLast("/").substringBefore("?").lowercase()
@@ -263,9 +269,13 @@ class WaveFlixProvider : MainAPI() {
             val fileKey = if (isMediaFile && fileName.length > 10) fileName else null
             val isFileDuplicate = fileKey != null && !seenFileKeys.add(fileKey)
 
+            // Prevent duplicate links with the exact same display name and source from cluttering the selector
+            val linkIdentity = "${link.source}::${link.name}"
+            val isNameDuplicate = !seenLinkKeys.add(linkIdentity)
+
             val isZipInName = link.name.contains(".zip", ignoreCase = true) || link.name.contains(".rar", ignoreCase = true)
 
-            if (!isArchive && !isZipInName && !isLandingPage && !isExactDuplicate && !isFileDuplicate && rawUrl.startsWith("http")) {
+            if (!isArchive && !isZipInName && !isLandingPage && !isExactDuplicate && !isFileDuplicate && !isNameDuplicate && rawUrl.startsWith("http")) {
                 synchronized(callback) {
                     callback(link)
                 }
