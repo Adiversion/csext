@@ -232,6 +232,81 @@ class WaveFlixProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean = coroutineScope {
+        // Self-Healing Link Interceptor: filters unplayable containers (3003) & dead streams before ExoPlayer ever sees them
+        val seenUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val seenFileKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+        val selfHealingCallback: (ExtractorLink) -> Unit = { link ->
+            val rawUrl = link.url.trim()
+            val lower = rawUrl.lowercase()
+
+            // 1. Invariant: Discard non-streamable archives (PKZip, rar, 7z, tar, iso)
+            // ExoPlayer UnrecognizedInputFormatException (3003) is 100% triggered by .zip archives
+            val isArchive = lower.endsWith(".zip") || lower.contains(".zip?") ||
+                            lower.contains(".mkv.zip") || lower.contains(".mp4.zip") ||
+                            lower.endsWith(".rar") || lower.contains(".rar?") ||
+                            lower.endsWith(".7z") || lower.endsWith(".tar") ||
+                            lower.endsWith(".iso") || lower.endsWith(".exe")
+
+            // 2. Invariant: Discard ad-gate landing pages returning text/html
+            val isLandingPage = (lower.contains("pixel.hubcloud") && !lower.contains("link=")) ||
+                                lower.contains("gamerxyt.com/hubcloud.php") ||
+                                lower.contains("hubcloud.ist/drive/") ||
+                                lower.contains("tinyurl.com")
+
+            // 3. Deduplication: Prevent flooding the player queue with identical dead links & duplicate worker mirrors
+            val isExactDuplicate = !seenUrls.add(rawUrl)
+
+            // Check media file duplication across mirrors (e.g. 4 workers serving the exact same MKV file)
+            val fileName = rawUrl.substringAfterLast("/").substringBefore("?").lowercase()
+            val isMediaFile = fileName.endsWith(".mkv") || fileName.endsWith(".mp4")
+            val fileKey = if (isMediaFile && fileName.length > 10) fileName else null
+            val isFileDuplicate = fileKey != null && !seenFileKeys.add(fileKey)
+
+            val isZipInName = link.name.contains(".zip", ignoreCase = true) || link.name.contains(".rar", ignoreCase = true)
+
+            if (!isArchive && !isZipInName && !isLandingPage && !isExactDuplicate && !isFileDuplicate && rawUrl.startsWith("http")) {
+                // 4. Dynamic Audio Tagging: Ensure link name indicates audio language (Multi/Dual/Hindi/Eng)
+                val currentName = link.name
+                val hasExistingAudio = currentName.contains("Audio", ignoreCase = true) ||
+                                       currentName.contains("Hindi", ignoreCase = true) ||
+                                       currentName.contains("English", ignoreCase = true) ||
+                                       currentName.contains("Tamil", ignoreCase = true) ||
+                                       currentName.contains("Telugu", ignoreCase = true) ||
+                                       currentName.contains("Dub", ignoreCase = true)
+
+                val finalName = if (!hasExistingAudio) {
+                    val extractedAudio = when {
+                        rawUrl.contains("vidbolt") || rawUrl.contains("hakunabolt") || rawUrl.contains("hakunaymatata") -> "[Multi-Audio ⚡ Direct]"
+                        rawUrl.contains("vidlink") -> "[Multi-Audio ⚡]"
+                        else -> extractAudioTag(rawUrl, link.referer, link.source)
+                    }
+                    if (extractedAudio.isNotBlank()) {
+                        "$currentName $extractedAudio"
+                    } else currentName
+                } else currentName
+
+                val finalLink = if (finalName != currentName) {
+                    newExtractorLink(
+                        source = link.source,
+                        name = finalName,
+                        url = link.url,
+                        type = link.type
+                    ) {
+                        this.referer = link.referer
+                        this.headers = link.headers
+                        this.quality = link.quality
+                    }
+                } else {
+                    link
+                }
+
+                synchronized(callback) {
+                    callback(finalLink)
+                }
+            }
+        }
+
         val linkData = parseJson<WaveLinkData>(data)
         val tmdbId = linkData.tmdbId
         val isMovie = linkData.isMovie
@@ -354,21 +429,24 @@ class WaveFlixProvider : MainAPI() {
                                             if (!streamUrl.contains("filepress") && !streamUrl.contains("filebee")) {
                                                 async {
                                                     try {
-                                                        loadExtractor(streamUrl, streamReferer, subtitleCallback, callback)
+                                                        loadExtractor(streamUrl, streamReferer, subtitleCallback, selfHealingCallback)
                                                     } catch (_: Throwable) {}
                                                 }
                                             } else null
                                         } else {
                                             async {
                                                 val isPlayable = try {
-                                                    if (streamUrl.contains("workers.dev") || streamUrl.contains("hscow.com") || streamUrl.contains("cloudflarestorage.com") || streamUrl.contains("kkphimplayer") || streamUrl.contains("remoteconsultinggroup")) {
+                                                    val lowerUrl = streamUrl.lowercase()
+                                                    if (lowerUrl.contains(".zip") || lowerUrl.contains(".rar") || lowerUrl.contains(".7z")) {
+                                                        false
+                                                    } else if (streamUrl.contains("hscow.com") || streamUrl.contains("cloudflarestorage.com") || streamUrl.contains("kkphimplayer") || streamUrl.contains("remoteconsultinggroup")) {
                                                         true
                                                     } else {
                                                         val probeHeaders = if (isHls || isMpd) streamHeaders else streamHeaders + ("Range" to "bytes=0-1024")
                                                         val check = app.get(streamUrl, headers = probeHeaders, timeout = 4)
                                                         val cType = (check.headers["Content-Type"] ?: check.headers["content-type"])?.lowercase() ?: ""
-                                                        val isNotHtml = !cType.contains("text/html")
-                                                        (check.isSuccessful || check.code in 200..299) && check.code != 400 && check.code != 403 && isNotHtml
+                                                        val isNotHtml = !cType.contains("text/html") && !cType.contains("application/zip") && !cType.contains("application/json")
+                                                        (check.isSuccessful || check.code in 200..299) && check.code != 400 && check.code != 403 && check.code != 429 && isNotHtml
                                                     }
                                                 } catch (_: Throwable) {
                                                     isHls || isMpd || streamUrl.contains(".mp4")
@@ -380,9 +458,11 @@ class WaveFlixProvider : MainAPI() {
                                                         isHls -> ExtractorLinkType.M3U8
                                                         else -> ExtractorLinkType.VIDEO
                                                     }
+                                                    val audioTag = extractAudioTag(streamUrl, qualityLabel, src.label, src.provider, serverDisplayName)
+                                                    val displayAudio = if (audioTag.isNotBlank() && !qualityLabel.contains(audioTag)) " $audioTag" else ""
                                                     val link = newExtractorLink(
                                                         source = "WaveFlix [$serverDisplayName]",
-                                                        name = "$serverDisplayName - $qualityLabel",
+                                                        name = "$serverDisplayName - $qualityLabel$displayAudio",
                                                         url = streamUrl,
                                                         type = linkType
                                                     ) {
@@ -390,9 +470,7 @@ class WaveFlixProvider : MainAPI() {
                                                         this.headers = streamHeaders
                                                         this.quality = qualityInt
                                                     }
-                                                    synchronized(callback) {
-                                                        callback(link)
-                                                    }
+                                                    selfHealingCallback(link)
                                                 }
                                             }
                                         }
@@ -445,9 +523,7 @@ class WaveFlixProvider : MainAPI() {
                                 this.headers = streamHeaders
                                 this.quality = parseQuality("${resLabel}p")
                             }
-                            synchronized(callback) {
-                                callback(link)
-                            }
+                            selfHealingCallback(link)
                         }
                     }
                     netObj.captions?.forEach { cap ->
@@ -492,7 +568,7 @@ class WaveFlixProvider : MainAPI() {
                             )
                             val link = newExtractorLink(
                                 source = "WaveFlix [Vidlink]",
-                                name = "Vidlink - ${qKey}p [Direct Stream ⚡]",
+                                name = "Vidlink - ${qKey}p [Direct Stream ⚡ Multi-Audio]",
                                 url = streamUrl,
                                 type = ExtractorLinkType.VIDEO
                             ) {
@@ -500,9 +576,7 @@ class WaveFlixProvider : MainAPI() {
                                 this.headers = streamHeaders
                                 this.quality = parseQuality("${qKey}p")
                             }
-                            synchronized(callback) {
-                                callback(link)
-                            }
+                            selfHealingCallback(link)
                         }
                     }
                 }
@@ -518,7 +592,7 @@ class WaveFlixProvider : MainAPI() {
         val allMovieLandJob = async {
             if (isMovie && searchTitle.isNotBlank()) {
                 try {
-                    queryAllMovieLand(searchTitle, coreTokens, linkData.year, isMovie, season, episode, subtitleCallback, callback)
+                    queryAllMovieLand(searchTitle, coreTokens, linkData.year, isMovie, season, episode, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -527,7 +601,7 @@ class WaveFlixProvider : MainAPI() {
         val rogMoviesJob = async {
             if (searchTitle.isNotBlank() || !imdbId.isNullOrBlank()) {
                 try {
-                    queryRogMovies(searchTitle, coreTokens, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, callback)
+                    queryRogMovies(searchTitle, coreTokens, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -535,7 +609,7 @@ class WaveFlixProvider : MainAPI() {
         // 7. Direct MultiMovies Integration (Cineverse / Filmu / Nexus / VidBolt / Vidrift)
         val multiMoviesJob = async {
             try {
-                queryMultiMovies(tmdbId.toString(), imdbId, isMovie, season, episode, subtitleCallback, callback)
+                queryMultiMovies(tmdbId.toString(), imdbId, isMovie, season, episode, subtitleCallback, selfHealingCallback)
             } catch (_: Throwable) {}
         }
 
@@ -543,7 +617,7 @@ class WaveFlixProvider : MainAPI() {
         val bollyflixJob = async {
             if (searchTitle.isNotBlank() || !imdbId.isNullOrBlank()) {
                 try {
-                    queryBollyflix(searchTitle, coreTokens, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, callback)
+                    queryBollyflix(searchTitle, coreTokens, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -552,7 +626,7 @@ class WaveFlixProvider : MainAPI() {
         val katMovieJob = async {
             if (searchTitle.isNotBlank()) {
                 try {
-                    queryKatMovieHD(searchTitle, linkData.year, isMovie, season, episode, subtitleCallback, callback)
+                    queryKatMovieHD(searchTitle, linkData.year, isMovie, season, episode, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -561,7 +635,7 @@ class WaveFlixProvider : MainAPI() {
         val hdhub4uJob = async {
             if (searchTitle.isNotBlank() || !imdbId.isNullOrBlank()) {
                 try {
-                    queryHDHub4u(searchTitle, coreTokens, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, callback)
+                    queryHDHub4u(searchTitle, coreTokens, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -570,7 +644,7 @@ class WaveFlixProvider : MainAPI() {
         val moviesDriveJob = async {
             if (searchTitle.isNotBlank() || !imdbId.isNullOrBlank()) {
                 try {
-                    queryMoviesDrive(searchTitle, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, callback)
+                    queryMoviesDrive(searchTitle, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -579,7 +653,7 @@ class WaveFlixProvider : MainAPI() {
         val moviesModJob = async {
             if (searchTitle.isNotBlank() || !imdbId.isNullOrBlank()) {
                 try {
-                    queryMoviesmod(searchTitle, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, callback)
+                    queryMoviesmod(searchTitle, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -588,7 +662,16 @@ class WaveFlixProvider : MainAPI() {
         val uhdMoviesJob = async {
             if (searchTitle.isNotBlank()) {
                 try {
-                    queryUHDMovies(searchTitle, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, callback)
+                    queryUHDMovies(searchTitle, linkData.year, isMovie, season, episode, imdbId, subtitleCallback, selfHealingCallback)
+                } catch (_: Throwable) {}
+            }
+        }
+
+        // 14. 4K-HDHub – Direct 4K/1080p Multi/Dual-Audio & Single EP's Integration
+        val fourKhubJob = async {
+            if (searchTitle.isNotBlank()) {
+                try {
+                    query4kHdHub(searchTitle, linkData.year, isMovie, season, episode, subtitleCallback, selfHealingCallback)
                 } catch (_: Throwable) {}
             }
         }
@@ -605,6 +688,7 @@ class WaveFlixProvider : MainAPI() {
         moviesDriveJob.await()
         moviesModJob.await()
         uhdMoviesJob.await()
+        fourKhubJob.await()
         subtitleJob.await()
         true
     }
@@ -921,6 +1005,146 @@ class WaveFlixProvider : MainAPI() {
         return null
     }
 
+
+    private suspend fun query4kHdHub(
+        query: String,
+        year: Int?,
+        isMovie: Boolean,
+        season: Int,
+        episode: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) = coroutineScope {
+        val base = DomainResolver.get("fourkhdhub").ifBlank { "https://4khdhub.one" }
+        val browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        val fourKHeaders = mapOf(
+            "User-Agent" to browserUA,
+            "Referer" to "$base/"
+        )
+
+        val cleanTitle = query.lowercase().replace(Regex("[^a-z0-9 ]+"), " ").trim()
+        val tokens = cleanTitle.split(" ").filter { it.length > 2 }
+        if (tokens.isEmpty()) return@coroutineScope
+
+        val searchUrl = "$base/?s=${URLEncoder.encode(cleanTitle, "UTF-8")}"
+        val searchRes = runCatching {
+            app.get(searchUrl, headers = fourKHeaders, timeout = 8)
+        }.getOrNull() ?: return@coroutineScope
+
+        DomainResolver.reportRedirect("fourkhdhub", searchRes.url)
+        val searchDoc = Jsoup.parse(searchRes.text)
+
+        val matchingPosts = searchDoc.select("a[href]").mapNotNull { a ->
+            val href = a.attr("href").trim()
+            if (href.isBlank()) return@mapNotNull null
+            val isTargetType = if (isMovie) href.contains("-movie-") else href.contains("-series-")
+            if (!isTargetType) return@mapNotNull null
+
+            val text = a.text().lowercase()
+            val hrefLower = href.lowercase()
+            val matchesTokens = tokens.all { hrefLower.contains(it) || text.contains(it) }
+            if (matchesTokens) {
+                if (href.startsWith("http")) href else "$base${if (href.startsWith("/")) "" else "/"}$href"
+            } else null
+        }.distinct().take(3)
+
+        if (matchingPosts.isEmpty()) return@coroutineScope
+
+        val postJobs = matchingPosts.map { postUrl ->
+            async {
+                try {
+                    val postRes = runCatching {
+                        app.get(postUrl, headers = fourKHeaders, timeout = 10)
+                    }.getOrNull() ?: return@async
+                    DomainResolver.reportRedirect("fourkhdhub", postRes.url)
+                    val postDoc = Jsoup.parse(postRes.text)
+
+                    if (isMovie) {
+                        for (a in postDoc.select("a[href]")) {
+                            val href = a.attr("href").trim()
+                            if (href.contains("greenmotors.") || href.contains("hubdrive.") ||
+                                href.contains("hubcloud.") || href.contains("hblinks.") ||
+                                href.contains("katdrive.") || href.contains("fastdl.")) {
+
+                                val precedingText = a.parents().firstOrNull { p ->
+                                    val t = p.text()
+                                    t.contains("2160p", ignoreCase = true) || t.contains("1080p", ignoreCase = true) ||
+                                    t.contains("720p", ignoreCase = true) || t.contains("480p", ignoreCase = true)
+                                }?.text() ?: a.text()
+
+                                val postTitle = postUrl.substringAfterLast("/").replace("-", " ")
+                                val audioTag = extractAudioTag(postTitle, precedingText, a.text())
+                                val qualityTag = when {
+                                    precedingText.contains("2160p", ignoreCase = true) || precedingText.contains("4k", ignoreCase = true) -> "2160p"
+                                    precedingText.contains("1080p", ignoreCase = true) -> "1080p"
+                                    precedingText.contains("720p", ignoreCase = true) -> "720p"
+                                    precedingText.contains("480p", ignoreCase = true) -> "480p"
+                                    else -> null
+                                }
+
+                                val tagBuilder = StringBuilder()
+                                if (qualityTag != null) tagBuilder.append("#$qualityTag")
+                                if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
+                                val taggedHref = if (tagBuilder.isNotEmpty() && !href.contains("#")) "$href$tagBuilder" else href
+
+                                runCatching {
+                                    loadExtractor(taggedHref, postUrl, subtitleCallback, callback)
+                                }
+                            }
+                        }
+                    } else {
+                        // Series: Specifically target .episode-download-item (the "Single EP's" tab)
+                        // Bypasses the "Zip/Pack" tab completely so .zip files are never scraped
+                        val padEp = episode.toString().padStart(2, '0')
+                        val rawEp = episode.toString()
+                        val padS = season.toString().padStart(2, '0')
+                        val rawS = season.toString()
+
+                        val epPatterns = listOf(
+                            Regex("""\bS0?$rawS[E.]0?$rawEp\b""", RegexOption.IGNORE_CASE),
+                            Regex("""\b(?:Episode|EP)[-.\s]*0?$rawEp\b""", RegexOption.IGNORE_CASE)
+                        )
+
+                        val episodeItems = postDoc.select(".episode-download-item")
+                        for (item in episodeItems) {
+                            val titleEl = item.selectFirst(".episode-file-title, .file-title, h4, h5, div")
+                            val titleText = titleEl?.text()?.trim() ?: item.text().trim()
+
+                            val matchesEpisode = epPatterns.any { it.containsMatchIn(titleText) }
+                            if (matchesEpisode) {
+                                val qualityTag = when {
+                                    titleText.contains("2160p", ignoreCase = true) || titleText.contains("4k", ignoreCase = true) -> "2160p"
+                                    titleText.contains("1080p", ignoreCase = true) -> "1080p"
+                                    titleText.contains("720p", ignoreCase = true) -> "720p"
+                                    titleText.contains("480p", ignoreCase = true) -> "480p"
+                                    else -> null
+                                }
+                                val audioTag = extractAudioTag(titleText, item.text())
+
+                                val tagBuilder = StringBuilder()
+                                if (qualityTag != null) tagBuilder.append("#$qualityTag")
+                                if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
+
+                                for (a in item.select("a[href]")) {
+                                    val href = a.attr("href").trim()
+                                    if (href.contains("greenmotors.") || href.contains("hubdrive.") ||
+                                        href.contains("hubcloud.") || href.contains("hblinks.") ||
+                                        href.contains("katdrive.") || href.contains("fastdl.")) {
+                                        val taggedUrl = if (tagBuilder.isNotEmpty() && !href.contains("#")) "$href$tagBuilder" else href
+                                        runCatching {
+                                            loadExtractor(taggedUrl, postUrl, subtitleCallback, callback)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
+        postJobs.awaitAll()
+    }
+
     private suspend fun queryHDHub4u(
         query: String,
         coreTokens: List<String>,
@@ -1029,8 +1253,13 @@ class WaveFlixProvider : MainAPI() {
                         for (a in docPost.select("a[href]")) {
                             val href = a.attr("href").trim()
                             val btnText = a.text().trim()
+                            val postTitle = postUrl.substringAfterLast("/").replace("-", " ")
+                            val audioTag = extractAudioTag(postTitle, a.text())
                             val qualityTag = findPrecedingQualityTag(a)
-                            val taggedHref = if (qualityTag != null && !href.contains("#")) "$href#$qualityTag" else href
+                            val tagBuilder = StringBuilder()
+                            if (qualityTag != null) tagBuilder.append("#$qualityTag")
+                            if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
+                            val taggedHref = if (tagBuilder.isNotEmpty() && !href.contains("#")) "$href$tagBuilder" else href
 
                             if (href.contains("greenmotors.") || href.contains("hubdrive.") ||
                                 href.contains("hubcloud.") || href.contains("hblinks.") ||
@@ -1041,6 +1270,47 @@ class WaveFlixProvider : MainAPI() {
                             }
                         }
                     } else {
+                        val docPost = Jsoup.parse(postHtml)
+                        val epItems = docPost.select(".episode-download-item")
+                        if (epItems.isNotEmpty()) {
+                            val padEp = episode.toString().padStart(2, '0')
+                            val rawEp = episode.toString()
+                            val padS = season.toString().padStart(2, '0')
+                            val rawS = season.toString()
+                            val epPatterns = listOf(
+                                Regex("""\bS0?$rawS[E.]0?$rawEp\b""", RegexOption.IGNORE_CASE),
+                                Regex("""\b(?:Episode|EP)[-.\s]*0?$rawEp\b""", RegexOption.IGNORE_CASE)
+                            )
+                            for (item in epItems) {
+                                val titleEl = item.selectFirst(".episode-file-title, .file-title, h4, h5, div")
+                                val titleText = titleEl?.text()?.trim() ?: item.text().trim()
+                                if (epPatterns.any { it.containsMatchIn(titleText) }) {
+                                    val qualityTag = when {
+                                        titleText.contains("2160p", ignoreCase = true) || titleText.contains("4k", ignoreCase = true) -> "2160p"
+                                        titleText.contains("1080p", ignoreCase = true) -> "1080p"
+                                        titleText.contains("720p", ignoreCase = true) -> "720p"
+                                        titleText.contains("480p", ignoreCase = true) -> "480p"
+                                        else -> null
+                                    }
+                                    val audioTag = extractAudioTag(titleText, item.text())
+                                    val tagBuilder = StringBuilder()
+                                    if (qualityTag != null) tagBuilder.append("#$qualityTag")
+                                    if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
+                                    for (a in item.select("a[href]")) {
+                                        val linkUrl = a.attr("href").trim()
+                                        val taggedUrl = if (tagBuilder.isNotEmpty() && !linkUrl.contains("#")) "$linkUrl$tagBuilder" else linkUrl
+                                        if (linkUrl.contains("greenmotors.") || linkUrl.contains("hubdrive.") ||
+                                            linkUrl.contains("hubcloud.") || linkUrl.contains("hblinks.") ||
+                                            linkUrl.contains("hubcdn.")) {
+                                            runCatching {
+                                                loadExtractor(taggedUrl, postUrl, subtitleCallback, callback)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         val padEp = episode.toString().padStart(2, '0')
                         val rawEp = episode.toString()
                         val epRegex = Regex("""(?:E|Episode|EP)[\s.-]*(?:0?$rawEp|$padEp)\b[^<]*?(?:<a[\s\S]*?<\/h[1-6]>|<a[\s\S]*?<\/p>|<a[\s\S]*?<\/div>|$)""", RegexOption.IGNORE_CASE)
@@ -1050,6 +1320,8 @@ class WaveFlixProvider : MainAPI() {
                             val aRegex = Regex("""href=["'](https?://[^"']+)["']""", RegexOption.IGNORE_CASE)
                             for (m in epMatches) {
                                 val matchText = m.value
+                                val postTitle = postUrl.substringAfterLast("/").replace("-", " ")
+                                val audioTag = extractAudioTag(postTitle, matchText)
                                 val qualityTag = when {
                                     matchText.contains("2160p", ignoreCase = true) || matchText.contains("4k", ignoreCase = true) -> "2160p"
                                     matchText.contains("1080p", ignoreCase = true) -> "1080p"
@@ -1057,9 +1329,12 @@ class WaveFlixProvider : MainAPI() {
                                     matchText.contains("480p", ignoreCase = true) -> "480p"
                                     else -> null
                                 }
+                                val tagBuilder = StringBuilder()
+                                if (qualityTag != null) tagBuilder.append("#$qualityTag")
+                                if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
                                 for (aMatch in aRegex.findAll(m.value)) {
                                     val linkUrl = aMatch.groupValues[1]
-                                    val taggedUrl = if (qualityTag != null && !linkUrl.contains("#")) "$linkUrl#$qualityTag" else linkUrl
+                                    val taggedUrl = if (tagBuilder.isNotEmpty() && !linkUrl.contains("#")) "$linkUrl$tagBuilder" else linkUrl
                                     if (linkUrl.contains("greenmotors.") || linkUrl.contains("hubdrive.") ||
                                         linkUrl.contains("hubcloud.") || linkUrl.contains("hblinks.") ||
                                         linkUrl.contains("hubcdn.")) {
@@ -1074,6 +1349,8 @@ class WaveFlixProvider : MainAPI() {
                             for (m in epHrefRegex.findAll(postHtml)) {
                                 val linkUrl = m.groupValues[1]
                                 val fullMatch = m.value
+                                val postTitle = postUrl.substringAfterLast("/").replace("-", " ")
+                                val audioTag = extractAudioTag(postTitle, fullMatch)
                                 val qualityTag = when {
                                     fullMatch.contains("2160p", ignoreCase = true) || fullMatch.contains("4k", ignoreCase = true) -> "2160p"
                                     fullMatch.contains("1080p", ignoreCase = true) -> "1080p"
@@ -1081,7 +1358,10 @@ class WaveFlixProvider : MainAPI() {
                                     fullMatch.contains("480p", ignoreCase = true) -> "480p"
                                     else -> null
                                 }
-                                val taggedUrl = if (qualityTag != null && !linkUrl.contains("#")) "$linkUrl#$qualityTag" else linkUrl
+                                val tagBuilder = StringBuilder()
+                                if (qualityTag != null) tagBuilder.append("#$qualityTag")
+                                if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
+                                val taggedUrl = if (tagBuilder.isNotEmpty() && !linkUrl.contains("#")) "$linkUrl$tagBuilder" else linkUrl
                                 if (linkUrl.contains("greenmotors.") || linkUrl.contains("hubdrive.") ||
                                     linkUrl.contains("hubcloud.") || linkUrl.contains("hblinks.") ||
                                     linkUrl.contains("hubcdn.")) {
@@ -1430,8 +1710,13 @@ class WaveFlixProvider : MainAPI() {
                 }
                 if (isSpecificOtherEp) return@forEach
             }
+            val postSlug = targetPost.substringAfterLast("/").replace("-", " ")
+            val audioTag = extractAudioTag(postSlug, a.text(), a.parent()?.text())
             val qualityTag = findPrecedingQualityTag(a)
-            val taggedHref = if (qualityTag != null && !href.contains("#")) "$href#$qualityTag" else href
+            val tagBuilder = StringBuilder()
+            if (qualityTag != null) tagBuilder.append("#$qualityTag")
+            if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
+            val taggedHref = if (tagBuilder.isNotEmpty() && !href.contains("#")) "$href$tagBuilder" else href
             if (href.startsWith("http")) {
                 runCatching {
                     loadExtractor(taggedHref, targetPost, subtitleCallback, callback)
@@ -1554,8 +1839,13 @@ class WaveFlixProvider : MainAPI() {
                     }
                     if (isSpecificOtherEp) return@forEach
                 }
+                val hitTitle = hit.document?.post_title ?: ""
+                val audioTag = extractAudioTag(hitTitle, btnText)
                 val qualityTag = findPrecedingQualityTag(a)
-                val taggedHref = if (qualityTag != null && !href.contains("#")) "$href#$qualityTag" else href
+                val tagBuilder = StringBuilder()
+                if (qualityTag != null) tagBuilder.append("#$qualityTag")
+                if (audioTag.isNotBlank()) tagBuilder.append("#$audioTag")
+                val taggedHref = if (tagBuilder.isNotEmpty() && !href.contains("#")) "$href$tagBuilder" else href
 
                 if (href.startsWith("http") && !href.contains("filepress") && !href.contains("filebee") && !href.contains("nexdrive")) {
                     runCatching {

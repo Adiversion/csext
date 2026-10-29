@@ -98,6 +98,71 @@ fun formatQualityTag(q: Int): String {
     }
 }
 
+fun extractAudioTag(vararg sources: String?): String {
+    for (s in sources) {
+        if (s.isNullOrBlank()) continue
+        val decoded = runCatching { java.net.URLDecoder.decode(s, "UTF-8") }.getOrDefault(s)
+        val lower = decoded.lowercase()
+
+        // 1. Detect Multi-Audio / Dual-Audio flags
+        val hasMulti = Regex("""\b(multi|multiaudio|multi-audio|multi\.audio|multiple|all\.audio)\b""", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+        val hasDual = Regex("""\b(dual|dualaudio|dual-audio|dual\.audio)\b""", RegexOption.IGNORE_CASE).containsMatchIn(lower)
+
+        // 2. Detect Specific Language Tags with positional appearance ordering
+        val langPatterns = listOf(
+            "Hindi" to Regex("""\b(hindi|hind|hin\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "English" to Regex("""\b(english|eng\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "Tamil" to Regex("""\b(tamil|tam\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "Telugu" to Regex("""\b(telugu|tel\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "Malayalam" to Regex("""\b(malayalam|mal\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "Kannada" to Regex("""\b(kannada|kan\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "Bengali" to Regex("""\b(bengali|bangla)\b""", RegexOption.IGNORE_CASE),
+            "Marathi" to Regex("""\b(marathi)\b""", RegexOption.IGNORE_CASE),
+            "Punjabi" to Regex("""\b(punjabi)\b""", RegexOption.IGNORE_CASE),
+            "Korean" to Regex("""\b(korean|kor\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "Japanese" to Regex("""\b(japanese|jap\b(?=[-+._/\]\s]))""", RegexOption.IGNORE_CASE),
+            "Spanish" to Regex("""\b(spanish|esp)\b""", RegexOption.IGNORE_CASE),
+            "French" to Regex("""\b(french|fra)\b""", RegexOption.IGNORE_CASE)
+        )
+
+        val found = mutableListOf<Pair<Int, String>>()
+        for ((langName, pattern) in langPatterns) {
+            val match = pattern.find(lower)
+            if (match != null) {
+                found.add(match.range.first to langName)
+            }
+        }
+        found.sortBy { it.first }
+        val distinctLangs = found.map { it.second }.distinct()
+
+        if (hasMulti || distinctLangs.size >= 3) {
+            return if (distinctLangs.isNotEmpty()) {
+                val shortLangs = distinctLangs.map { it.take(3) }.joinToString("+")
+                "[Multi-Audio: $shortLangs 🌐]"
+            } else {
+                "[Multi-Audio 🌐]"
+            }
+        }
+        if (distinctLangs.size == 2) {
+            val l1 = distinctLangs[0].take(3)
+            val l2 = distinctLangs[1].take(3)
+            return "[Dual Audio: $l1+$l2 ⚡]"
+        }
+        if (hasDual) {
+            return if (distinctLangs.isNotEmpty()) {
+                val l1 = distinctLangs[0].take(3)
+                "[Dual Audio: $l1 ⚡]"
+            } else {
+                "[Dual Audio: Hin+Eng ⚡]"
+            }
+        }
+        if (distinctLangs.size == 1) {
+            return "[${distinctLangs[0]}]"
+        }
+    }
+    return ""
+}
+
 
 open class VCloudExtractor : ExtractorApi() {
     override val name = "V-Cloud"
@@ -146,6 +211,13 @@ open class VCloudExtractor : ExtractorApi() {
             tokenUrl,
             url
         )
+        val detectedAudio = extractAudioTag(
+            url.substringAfter("#", "").takeIf { it.isNotBlank() && it != url },
+            finalDoc.select(".card-title, .card-header, h5, h4").firstOrNull()?.text(),
+            tokenUrl,
+            url
+        )
+        val audioTag = if (detectedAudio.isNotBlank()) " $detectedAudio" else ""
 
         val fslLinks = finalDoc.select("a[href*='r2.dev'], a[href*='r2.cloudflarestorage.com'], a:contains(FSL)")
         fslLinks.forEach { a ->
@@ -159,6 +231,8 @@ open class VCloudExtractor : ExtractorApi() {
                     a.parent()?.text(),
                     formatQualityTag(detectedQuality)
                 )
+                val linkA = extractAudioTag(a.text(), a.parent()?.text(), href, detectedAudio)
+                val finalA = if (linkA.isNotBlank()) " $linkA" else audioTag
                 val finalQ = if (linkQ != Qualities.Unknown.value) linkQ else detectedQuality
                 val qTag = formatQualityTag(finalQ)
                 val displayQ = if (qTag.isNotBlank()) " $qTag" else ""
@@ -166,7 +240,7 @@ open class VCloudExtractor : ExtractorApi() {
                 callback.invoke(
                     newExtractorLink(
                         source = name,
-                        name = "$name - ${if (isFsl2) "FSLv2" else "FSL"} [Fast R2 Stream ⚡]$displayQ",
+                        name = "$name - ${if (isFsl2) "FSLv2" else "FSL"} [Fast R2 Stream ⚡]$displayQ$finalA",
                         url = href,
                         type = ExtractorLinkType.VIDEO
                     ) {
@@ -247,6 +321,11 @@ open class FastDLExtractor : ExtractorApi() {
             url.substringAfter("#", "").takeIf { it.isNotBlank() && it != url },
             url
         )
+        val detectedAudio = extractAudioTag(
+            url.substringAfter("#", "").takeIf { it.isNotBlank() && it != url },
+            url
+        )
+        val audioTag = if (detectedAudio.isNotBlank()) " $detectedAudio" else ""
 
         // 1. Direct reurl script detection (exclude non-seekable Google download links)
         val reurlMatch = Regex("""var\s+reurl\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
@@ -259,12 +338,14 @@ open class FastDLExtractor : ExtractorApi() {
                     streamTarget,
                     formatQualityTag(detectedQuality)
                 )
+                val a1 = extractAudioTag(streamTarget, detectedAudio)
                 val qTag1 = formatQualityTag(q1)
                 val displayQ1 = if (qTag1.isNotBlank()) " $qTag1" else ""
+                val displayA1 = if (a1.isNotBlank()) " $a1" else audioTag
                 callback.invoke(
                     newExtractorLink(
                         source = name,
-                        name = "$name - Instant Stream [⚡]$displayQ1",
+                        name = "$name - Instant Stream [⚡]$displayQ1$displayA1",
                         url = streamTarget,
                         type = ExtractorLinkType.VIDEO
                     ) {
@@ -298,12 +379,14 @@ open class FastDLExtractor : ExtractorApi() {
                         target,
                         formatQualityTag(detectedQuality)
                     )
+                    val a2 = extractAudioTag(target, detectedAudio)
                     val qTag2 = formatQualityTag(q2)
                     val displayQ2 = if (qTag2.isNotBlank()) " $qTag2" else ""
+                    val displayA2 = if (a2.isNotBlank()) " $a2" else audioTag
                     callback.invoke(
                         newExtractorLink(
                             source = name,
-                            name = "$name - Direct Stream [⚡]$displayQ2",
+                            name = "$name - Direct Stream [⚡]$displayQ2$displayA2",
                             url = target,
                             type = ExtractorLinkType.VIDEO
                         ) {
@@ -384,7 +467,17 @@ open class HubdriveExtractor : ExtractorApi() {
 
         val hubcloudMatch = Regex("""href=["'](https?://hubcloud\.[a-z]+/drive/[^"']+)["']""").find(html)?.groupValues?.get(1)
         if (!hubcloudMatch.isNullOrBlank()) {
-            loadExtractor(hubcloudMatch, subtitleCallback, callback)
+            val hashIdx = url.indexOf('#')
+            val hashTag = if (hashIdx != -1) url.substring(hashIdx) else ""
+            val docTitle = Regex("""<title>(.*?)</title>""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1) ?: ""
+            val qTag = formatQualityTag(extractResolution(url, docTitle))
+            val aTag = extractAudioTag(url, docTitle)
+            val tagBuilder = StringBuilder()
+            if (qTag.isNotBlank() && !hashTag.contains(qTag)) tagBuilder.append("#$qTag")
+            if (aTag.isNotBlank() && !hashTag.contains(aTag)) tagBuilder.append("#$aTag")
+            val finalTag = hashTag + tagBuilder.toString()
+            val forwardUrl = if (finalTag.isNotBlank() && !hubcloudMatch.contains("#")) "$hubcloudMatch$finalTag" else hubcloudMatch
+            loadExtractor(forwardUrl, subtitleCallback, callback)
         }
     }
 }
@@ -395,6 +488,22 @@ class HubdrivePicsExtractor : HubdriveExtractor() {
 
 class HubdriveLolExtractor : HubdriveExtractor() {
     override val mainUrl = "https://hubdrive.lol"
+}
+
+class HubdriveMeExtractor : HubdriveExtractor() {
+    override val mainUrl = "https://hubdrive.me"
+}
+
+class HubdriveProExtractor : HubdriveExtractor() {
+    override val mainUrl = "https://hubdrive.pro"
+}
+
+class HubdriveInExtractor : HubdriveExtractor() {
+    override val mainUrl = "https://hubdrive.in"
+}
+
+class HubdriveClubExtractor : HubdriveExtractor() {
+    override val mainUrl = "https://hubdrive.club"
 }
 
 open class HubcloudExtractor : ExtractorApi() {
@@ -432,6 +541,13 @@ open class HubcloudExtractor : ExtractorApi() {
             phpBtn,
             url
         )
+        val detectedAudio = extractAudioTag(
+            url.substringAfter("#", "").takeIf { it.isNotBlank() && it != url },
+            phpDoc.select(".card-title, .card-header, h5, h4").firstOrNull()?.text(),
+            driveDoc.select(".card-title, .card-header, h5, h4").firstOrNull()?.text(),
+            phpBtn,
+            url
+        )
 
         phpDoc.select("a.btn, a[href*='download'], div.card-body a").forEach { btn ->
             val href = btn.attr("href").trim()
@@ -446,12 +562,15 @@ open class HubcloudExtractor : ExtractorApi() {
             val qTag = formatQualityTag(finalQ)
             val displayQ = if (qTag.isNotBlank()) " $qTag" else ""
 
+            val linkAudio = extractAudioTag(btn.text(), btn.parent()?.text(), href, detectedAudio)
+            val audioTag = if (linkAudio.isNotBlank()) " $linkAudio" else if (detectedAudio.isNotBlank()) " $detectedAudio" else ""
+
             when {
                 href.contains("cloudflarestorage.com") || href.contains(".r2.dev") -> {
                     callback(
                         newExtractorLink(
                             source = name,
-                            name = "$name - [Fast CDN : Cloudflare R2 ⚡]$displayQ",
+                            name = "$name - [Fast CDN : Cloudflare R2 ⚡]$displayQ$audioTag",
                             url = href,
                             type = ExtractorLinkType.VIDEO
                         ) {
@@ -461,17 +580,46 @@ open class HubcloudExtractor : ExtractorApi() {
                     )
                 }
                 href.contains("pixel.hubcloud") -> {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name - [10Gbps PixelServer ⚡]$displayQ",
-                            url = href,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = phpBtn
-                            this.quality = finalQ
+                    val directParam = Regex("""[?&]link=(https?://[^"'\s&]+)""").find(href)?.groupValues?.get(1)
+                    if (!directParam.isNullOrBlank() && !directParam.contains(".zip", ignoreCase = true)) {
+                        val dAudio = extractAudioTag(directParam, audioTag)
+                        val pixelAudio = if (dAudio.isNotBlank()) " $dAudio" else audioTag
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name - [10Gbps PixelServer ⚡]$displayQ$pixelAudio",
+                                url = directParam,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = phpBtn
+                                this.quality = finalQ
+                            }
+                        )
+                    } else {
+                        // PixelServer is an ad-gate landing page if no link parameter is present.
+                        // Resolve the underlying direct download link safely without crashing ExoPlayer:
+                        runCatching {
+                            val pixelRes = app.get(href, headers = mapOf("User-Agent" to VCloudExtractor.USER_AGENT, "Referer" to phpBtn))
+                            val resolved = Regex("""[?&]link=(https?://[^"'\s&]+)""").find(pixelRes.url)?.groupValues?.get(1)
+                                ?: Regex("""id=["']downloadBtn["'][^>]*href=["'](https?://[^"']+)["']""").find(pixelRes.text)?.groupValues?.get(1)
+                                ?: Regex("""(?:window\.location|location\.href)\s*=\s*["'](https?://[^"']+)["']""").find(pixelRes.text)?.groupValues?.get(1)
+                            if (!resolved.isNullOrBlank() && !resolved.contains(".zip", ignoreCase = true) && resolved.startsWith("http")) {
+                                val rAudio = extractAudioTag(resolved, audioTag)
+                                val resolvedAudio = if (rAudio.isNotBlank()) " $rAudio" else audioTag
+                                callback(
+                                    newExtractorLink(
+                                        source = name,
+                                        name = "$name - [10Gbps PixelServer ⚡]$displayQ$resolvedAudio",
+                                        url = resolved,
+                                        type = ExtractorLinkType.VIDEO
+                                    ) {
+                                        this.referer = phpBtn
+                                        this.quality = finalQ
+                                    }
+                                )
+                            }
                         }
-                    )
+                    }
                 }
                 href.contains("pixeldrain") -> {
                     runCatching {
@@ -482,7 +630,7 @@ open class HubcloudExtractor : ExtractorApi() {
                     callback(
                         newExtractorLink(
                             source = name,
-                            name = "$name - [BuzzServer Fast]$displayQ",
+                            name = "$name - [BuzzServer Fast]$displayQ$audioTag",
                             url = href,
                             type = ExtractorLinkType.VIDEO
                         ) {
@@ -498,7 +646,7 @@ open class HubcloudExtractor : ExtractorApi() {
                         callback(
                             newExtractorLink(
                                 source = name,
-                                name = "$name - [WebPlayer CDN ⚡]$displayQ",
+                                name = "$name - [WebPlayer CDN ⚡]$displayQ$audioTag",
                                 url = decoded,
                                 type = ExtractorLinkType.VIDEO
                             ) {
@@ -509,17 +657,24 @@ open class HubcloudExtractor : ExtractorApi() {
                     }
                 }
                 (href.contains("workers.dev") || href.contains("cloudserver")) && !href.contains("gpdl.") -> {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name - [ZipDisk Server ⚡]$displayQ",
-                            url = href,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = ""
-                            this.quality = finalQ
-                        }
-                    )
+                    val isZip = href.endsWith(".zip", ignoreCase = true) || href.contains(".zip?", ignoreCase = true) ||
+                                href.contains(".mkv.zip", ignoreCase = true) || href.contains(".mp4.zip", ignoreCase = true) ||
+                                href.contains(".rar", ignoreCase = true) || href.contains(".7z", ignoreCase = true)
+                    if (!isZip) {
+                        val wAudio = extractAudioTag(href, audioTag)
+                        val workerAudio = if (wAudio.isNotBlank()) " $wAudio" else audioTag
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name - [ZipDisk Server ⚡]$displayQ$workerAudio",
+                                url = href,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = ""
+                                this.quality = finalQ
+                            }
+                        )
+                    }
                 }
                 href.contains("gpdl.") || btn.text().contains("10Gbps", ignoreCase = true) -> {
                     // Resolve 10Gbps redirect chain: gpdl -> workers.dev -> cryptonewz.online/dl.php?link=<google_url>
@@ -531,10 +686,12 @@ open class HubcloudExtractor : ExtractorApi() {
                             ?: Regex("""[?&]link=(https?://[^"'\s&]+)""").find(headRes.text)?.groupValues?.get(1)
 
                         if (!gLink.isNullOrBlank()) {
+                            val gAudio = extractAudioTag(gLink, audioTag)
+                            val gFinalAudio = if (gAudio.isNotBlank()) " $gAudio" else audioTag
                             callback(
                                 newExtractorLink(
                                     source = name,
-                                    name = "$name - [Server 10Gbps : Unbuffered Direct]$displayQ",
+                                    name = "$name - [Server 10Gbps : Unbuffered Direct]$displayQ$gFinalAudio",
                                     url = gLink,
                                     type = ExtractorLinkType.VIDEO
                                 ) {
@@ -725,14 +882,20 @@ open class KatdriveExtractor : ExtractorApi() {
             url.substringAfter("#", "").takeIf { it.isNotBlank() && it != url },
             m3u8Url
         )
+        val detectedAudio = extractAudioTag(
+            url.substringAfter("#", "").takeIf { it.isNotBlank() && it != url },
+            m3u8Url,
+            url
+        )
         val qTag = formatQualityTag(detectedQ)
         val displayQ = if (qTag.isNotBlank()) " $qTag" else ""
+        val audioTag = if (detectedAudio.isNotBlank()) " $detectedAudio" else ""
 
         if (!m3u8Url.isNullOrBlank()) {
             callback.invoke(
                 newExtractorLink(
                     source = name,
-                    name = "$name - HLS [KatMovieHD ⚡]$displayQ",
+                    name = "$name - HLS [KatMovieHD ⚡]$displayQ$audioTag",
                     url = m3u8Url,
                     type = ExtractorLinkType.M3U8
                 ) {
@@ -781,12 +944,17 @@ open class GreenmotorsExtractor : ExtractorApi() {
         val qTag = formatQualityTag(detectedQuality)
         val displayQ = if (qTag.isNotBlank()) " $qTag" else ""
 
+        val detectedAudio = extractAudioTag(url.substringAfter("#", ""), targetUrl, url)
+        val audioTag = if (detectedAudio.isNotBlank()) " $detectedAudio" else ""
+
         if (targetUrl.startsWith("http")) {
-            if (targetUrl.endsWith(".mkv") || targetUrl.endsWith(".mp4") || targetUrl.contains("workers.dev")) {
+            val isZip = targetUrl.endsWith(".zip", ignoreCase = true) || targetUrl.contains(".zip?", ignoreCase = true) ||
+                        targetUrl.contains(".mkv.zip", ignoreCase = true) || targetUrl.contains(".rar", ignoreCase = true)
+            if (!isZip && (targetUrl.endsWith(".mkv") || targetUrl.endsWith(".mp4") || (targetUrl.contains("workers.dev") && !targetUrl.contains(".zip")))) {
                 callback.invoke(
                     newExtractorLink(
                         source = name,
-                        name = "$name - Direct Stream [⚡]$displayQ",
+                        name = "$name - Direct Stream [⚡]$displayQ$audioTag",
                         url = targetUrl,
                         type = ExtractorLinkType.VIDEO
                     ) {
@@ -794,8 +962,11 @@ open class GreenmotorsExtractor : ExtractorApi() {
                         this.quality = detectedQuality
                     }
                 )
-            } else {
-                loadExtractor(targetUrl, url, subtitleCallback, callback)
+            } else if (!isZip) {
+                val hashIdx = url.indexOf('#')
+                val hashTag = if (hashIdx != -1) url.substring(hashIdx) else ""
+                val forwardUrl = if (hashTag.isNotEmpty() && !targetUrl.contains("#")) "$targetUrl$hashTag" else targetUrl
+                loadExtractor(forwardUrl, url, subtitleCallback, callback)
             }
         }
     }
@@ -832,15 +1003,19 @@ open class HblinksExtractor : ExtractorApi() {
             app.get(url, headers = mapOf("User-Agent" to VCloudExtractor.USER_AGENT, "Referer" to (referer ?: mainUrl))).text
         }.getOrNull() ?: return
 
+        val hashIdx = url.indexOf('#')
+        val hashTag = if (hashIdx != -1) url.substring(hashIdx) else ""
+
         val doc = Jsoup.parse(html)
         doc.select("a[href]").forEach { a ->
             val href = a.attr("href").trim()
             if (href.startsWith("http") && !href.contains("hblinks.lol/category") && !href.contains("wp-admin")) {
+                val forwardUrl = if (hashTag.isNotEmpty() && !href.contains("#")) "$href$hashTag" else href
                 when {
                     href.contains("hubcloud.") || href.contains("hubdrive.") || href.contains("hubcdn.") ||
                     href.contains("pixeldrain.") || href.contains("fastdl.") || href.contains("fuckingfast.") ||
                     href.contains("gdtot.") || href.contains(".workers.dev") -> {
-                        loadExtractor(href, url, subtitleCallback, callback)
+                        loadExtractor(forwardUrl, url, subtitleCallback, callback)
                     }
                 }
             }
@@ -886,14 +1061,21 @@ open class HubcdnExtractor : ExtractorApi() {
             decodedParam,
             url
         )
+        val detectedAudio = extractAudioTag(
+            url.substringAfter("#", "").takeIf { it.isNotBlank() && it != url },
+            streamUrl,
+            decodedParam,
+            url
+        )
         val qTag = formatQualityTag(detectedQuality)
         val displayQ = if (qTag.isNotBlank()) " $qTag" else ""
+        val audioTag = if (detectedAudio.isNotBlank()) " $detectedAudio" else ""
 
         if (!streamUrl.isNullOrBlank()) {
             callback.invoke(
                 newExtractorLink(
                     source = name,
-                    name = "$name - Direct [R2 Dev ⚡]$displayQ",
+                    name = "$name - Direct [R2 Dev ⚡]$displayQ$audioTag",
                     url = streamUrl,
                     type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
@@ -987,7 +1169,7 @@ open class VidboltExtractor : ExtractorApi() {
                             callback(
                                 newExtractorLink(
                                     source = name,
-                                    name = "$name [$srvName] - $qLabel [⚡ Direct]",
+                                    name = "$name [$srvName] - $qLabel [Multi-Audio ⚡ Direct]",
                                     url = sUrl,
                                     type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                 ) {
