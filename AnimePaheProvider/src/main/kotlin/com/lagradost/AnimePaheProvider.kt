@@ -499,6 +499,9 @@ class AnimePaheProvider : MainAPI() {
                         }
                     }
 
+                    var cookiesSaved = false
+                    val handler = Handler(Looper.getMainLooper())
+
                     // Start dialog window with 0 alpha so non-interactive Turnstile completes invisibly
                     dialog.window?.decorView?.alpha = 0f
 
@@ -614,8 +617,6 @@ class AnimePaheProvider : MainAPI() {
                         cfUserAgent = sanitizedUa
                     }
 
-                    var cookiesSaved = false
-                    val handler = Handler(Looper.getMainLooper())
                     var pollElapsedMs = 0L
 
                     fun extractPageContentAndFinish(cookies: String) {
