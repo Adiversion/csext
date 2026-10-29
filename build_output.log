@@ -30,10 +30,10 @@ Fetching JAR: cloudstream.jar
 > Task :WaveFlixProvider:generateDebugResValues
 > Task :WaveFlixProvider:generateDebugResources
 > Task :WaveFlixProvider:packageDebugResources
-> Task :WaveFlixProvider:parseDebugLocalResources
 > Task :AnimePaheProvider:parseDebugLocalResources
-> Task :AnimePaheProvider:generateDebugRFile
+> Task :WaveFlixProvider:parseDebugLocalResources
 > Task :WaveFlixProvider:generateDebugRFile
+> Task :AnimePaheProvider:generateDebugRFile
 
 > Task :AnimePaheProvider:compileDebugKotlin
 e: Daemon compilation failed: null
@@ -4848,5 +4848,5 @@ Made CloudStream package at /home/runner/work/csext/csext/src/WaveFlixProvider/b
 > Task :makePluginsJson
 Created /home/runner/work/csext/csext/src/build/plugins.json
 
-BUILD SUCCESSFUL in 2m 3s
+BUILD SUCCESSFUL in 1m 51s
 21 actionable tasks: 21 executed
