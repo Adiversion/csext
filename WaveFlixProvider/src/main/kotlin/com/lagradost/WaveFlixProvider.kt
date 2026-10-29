@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import org.jsoup.Jsoup
 import java.net.URLEncoder
 import java.security.MessageDigest
@@ -304,81 +305,82 @@ class WaveFlixProvider : MainAPI() {
         // 1. Fetch Multi-Language Subtitles from Nxsha Engine & Stremio OpenSubtitles v3 Engine
         val seenSubUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         val subtitleJob = async {
-            coroutineScope {
-                // A. Nxsha Subtitles Engine (Proxied & Re-encoded to UTF-8 CDN)
-                launch {
-                    try {
-                        val subPayload = """{"tmdbId":"$tmdbId","type":"${if (isMovie) "movie" else "tv"}","season":$season,"episode":$episode}"""
-                        val encSubQuery = NxshaCrypto.encrypt(subPayload)
-                        val subUrl = "https://nxsha.space/api/subtitles?q=${URLEncoder.encode(encSubQuery, "UTF-8")}"
+            // A. Nxsha Subtitles Engine (Proxied & Re-encoded to UTF-8 CDN)
+            val nxshaSubJob = async {
+                try {
+                    val subPayload = """{"tmdbId":"$tmdbId","type":"${if (isMovie) "movie" else "tv"}","season":$season,"episode":$episode}"""
+                    val encSubQuery = NxshaCrypto.encrypt(subPayload)
+                    val subUrl = "https://nxsha.space/api/subtitles?q=${URLEncoder.encode(encSubQuery, "UTF-8")}"
 
-                        val subRes = app.get(subUrl, headers = nxshaHeaders, timeout = 7).text
-                        val subHash = parseJson<NxshaHashResponse>(subRes).hash
-                        if (!subHash.isNullOrBlank()) {
-                            val decryptedSubJson = NxshaCrypto.decrypt(subHash)
-                            if (!decryptedSubJson.isNullOrBlank()) {
-                                val subObj = parseJson<NxshaSubtitlesResponse>(decryptedSubJson)
-                                subObj.subtitles?.forEach { sub ->
-                                    val trackUrl = sub.url ?: sub.uri ?: return@forEach
-                                    val trimmedUrl = trackUrl.trim()
-                                    val fileIdMatch = Regex("""/file/(\d+)""").find(trimmedUrl)?.groupValues?.get(1)
-                                    val cleanUrl = if (!fileIdMatch.isNullOrBlank()) {
-                                        "https://subs5.strem.io/en/download/subencoding-stremio-utf8/src-api/file/$fileIdMatch#.srt"
-                                    } else if (!trimmedUrl.contains(".srt") && !trimmedUrl.contains(".vtt")) {
-                                        "$trimmedUrl#.srt"
-                                    } else {
-                                        trimmedUrl
-                                    }
-                                    if (seenSubUrls.add(cleanUrl)) {
-                                        val langLabel = sub.title ?: sub.label ?: sub.language ?: sub.srclang ?: "English"
-                                        subtitleCallback(
-                                            newSubtitleFile(
-                                                lang = langLabel,
-                                                url = cleanUrl
-                                            )
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    } catch (_: Throwable) {}
-                }
-
-                // B. Stremio OpenSubtitles v3 Engine (IMDb Anchored, UTF-8 CDN, 50+ languages)
-                val targetImdb = linkData.imdbId
-                if (!targetImdb.isNullOrBlank()) {
-                    launch {
-                        try {
-                            val subUrl = if (isMovie) {
-                                "https://opensubtitles-v3.strem.io/subtitles/movie/$targetImdb.json"
-                            } else {
-                                "https://opensubtitles-v3.strem.io/subtitles/series/$targetImdb:$season:$episode.json"
-                            }
-                            val res = app.get(subUrl, timeout = 6).text
-                            val subResponse = parseJson<StremioSubtitleResponse>(res)
-                            subResponse.subtitles?.forEach { sub ->
-                                val sUrl = sub.url?.trim() ?: return@forEach
-                                val fileIdMatch = Regex("""/file/(\d+)""").find(sUrl)?.groupValues?.get(1)
-                                val cdnUrl = if (!fileIdMatch.isNullOrBlank()) {
-                                    "https://subs5.strem.io/en/download/subencoding-stremio-utf8/src-api/file/$fileIdMatch"
+                    val subRes = app.get(subUrl, headers = nxshaHeaders, timeout = 7).text
+                    val subHash = parseJson<NxshaHashResponse>(subRes).hash
+                    if (!subHash.isNullOrBlank()) {
+                        val decryptedSubJson = NxshaCrypto.decrypt(subHash)
+                        if (!decryptedSubJson.isNullOrBlank()) {
+                            val subObj = parseJson<NxshaSubtitlesResponse>(decryptedSubJson)
+                            subObj.subtitles?.forEach { sub ->
+                                val trackUrl = sub.url ?: sub.uri ?: return@forEach
+                                val trimmedUrl = trackUrl.trim()
+                                val fileIdMatch = Regex("""/file/(\d+)""").find(trimmedUrl)?.groupValues?.get(1)
+                                val cleanUrl = if (!fileIdMatch.isNullOrBlank()) {
+                                    "https://subs5.strem.io/en/download/subencoding-stremio-utf8/src-api/file/$fileIdMatch#.srt"
+                                } else if (!trimmedUrl.contains(".srt") && !trimmedUrl.contains(".vtt")) {
+                                    "$trimmedUrl#.srt"
                                 } else {
-                                    sUrl
+                                    trimmedUrl
                                 }
-                                val cleanUrl = if (!cdnUrl.contains(".srt") && !cdnUrl.contains(".vtt")) "$cdnUrl#.srt" else cdnUrl
                                 if (seenSubUrls.add(cleanUrl)) {
-                                    val cleanLang = mapSubtitleLanguage(sub.lang)
+                                    val langLabel = sub.title ?: sub.label ?: sub.language ?: sub.srclang ?: "English"
                                     subtitleCallback(
                                         newSubtitleFile(
-                                            lang = cleanLang,
+                                            lang = langLabel,
                                             url = cleanUrl
                                         )
                                     )
                                 }
                             }
-                        } catch (_: Throwable) {}
+                        }
                     }
-                }
+                } catch (_: Throwable) {}
             }
+
+            // B. Stremio OpenSubtitles v3 Engine (IMDb Anchored, UTF-8 CDN, 50+ languages)
+            val targetImdb = linkData.imdbId
+            val stremioSubJob = if (!targetImdb.isNullOrBlank()) {
+                async {
+                    try {
+                        val subUrl = if (isMovie) {
+                            "https://opensubtitles-v3.strem.io/subtitles/movie/$targetImdb.json"
+                        } else {
+                            "https://opensubtitles-v3.strem.io/subtitles/series/$targetImdb:$season:$episode.json"
+                        }
+                        val res = app.get(subUrl, timeout = 6).text
+                        val subResponse = parseJson<StremioSubtitleResponse>(res)
+                        subResponse.subtitles?.forEach { sub ->
+                            val sUrl = sub.url?.trim() ?: return@forEach
+                            val fileIdMatch = Regex("""/file/(\d+)""").find(sUrl)?.groupValues?.get(1)
+                            val cdnUrl = if (!fileIdMatch.isNullOrBlank()) {
+                                "https://subs5.strem.io/en/download/subencoding-stremio-utf8/src-api/file/$fileIdMatch"
+                            } else {
+                                sUrl
+                            }
+                            val cleanUrl = if (!cdnUrl.contains(".srt") && !cdnUrl.contains(".vtt")) "$cdnUrl#.srt" else cdnUrl
+                            if (seenSubUrls.add(cleanUrl)) {
+                                val cleanLang = mapSubtitleLanguage(sub.lang)
+                                subtitleCallback(
+                                    newSubtitleFile(
+                                        lang = cleanLang,
+                                        url = cleanUrl
+                                    )
+                                )
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+            } else null
+
+            nxshaSubJob.await()
+            stremioSubJob?.await()
         }
 
         // 2. Query Nxsha Multi-Server Playback Engine
