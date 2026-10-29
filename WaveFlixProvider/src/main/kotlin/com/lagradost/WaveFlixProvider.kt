@@ -515,55 +515,197 @@ class WaveFlixProvider : MainAPI() {
             }
         }
 
-        // 3. Direct NetMirror Stream Provider (Multi-Resolution Direct MP4 + Subtitles)
+        // 3. Direct NetMirror Stream Provider (Multi-Resolution Direct MP4 + Subtitles & NewTV M3U8 Engine)
         val netMirrorJob = async {
             try {
-                val netMirrorUrl = if (isMovie) {
-                    "https://net27.cc/api/embed-tmdb/$tmdbId"
-                } else {
-                    "https://net27.cc/api/embed-tmdb/$tmdbId?type=tv&se=$season&ep=$episode"
-                }
-                val netHeaders = mapOf(
-                    "User-Agent" to browserUserAgent,
-                    "Referer" to "https://net27.cc/"
-                )
-                val netRes = app.get(netMirrorUrl, headers = netHeaders, timeout = 7).text
-                val netObj = parseJson<NetMirrorResponse>(netRes)
-                if (netObj.ok == true) {
-                    netObj.streams?.forEach { s ->
-                        val streamUrl = s.url?.trim()
-                        if (!streamUrl.isNullOrBlank()) {
-                            val resLabel = s.resolution?.toString() ?: "720"
-                            val streamHeaders = mapOf(
-                                "User-Agent" to browserUserAgent,
-                                "Referer" to "https://videodownloader.site/"
-                            )
-                            val link = newExtractorLink(
-                                source = "WaveFlix [NetMirror]",
-                                name = "NetMirror - ${resLabel}p [Fast CDN ⚡]",
-                                url = streamUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = "https://videodownloader.site/"
-                                this.headers = streamHeaders
-                                this.quality = parseQuality("${resLabel}p")
-                            }
-                            selfHealingCallback(link)
-                        }
-                    }
-                    netObj.captions?.forEach { cap ->
-                        val capUrl = cap.url?.trim()
-                        if (!capUrl.isNullOrBlank()) {
-                            val cleanCapUrl = if (!capUrl.contains(".srt") && !capUrl.contains(".vtt")) "$capUrl#.srt" else capUrl
-                            if (seenSubUrls.add(cleanCapUrl)) {
-                                subtitleCallback(
-                                    newSubtitleFile(
-                                        lang = cap.name ?: cap.lang ?: "English",
-                                        url = cleanCapUrl
-                                    )
+                val cleanTitle = (linkData.title ?: "").trim()
+                if (cleanTitle.isNotBlank()) {
+                    val apiBase = NetMirrorResolver.resolveApiBase(app)
+                    var userToken = NetMirrorResolver.getUserToken(app, apiBase)
+
+                    // Helper to fetch player and emit links
+                    suspend fun tryPlayer(targetId: String, ott: String): Boolean {
+                        val currentToken = userToken ?: return false
+                        val playerHeaders = NetMirrorResolver.baseHeaders + mapOf(
+                            "Usertoken" to currentToken,
+                            "Ott" to ott
+                        )
+                        val playerUrl = "$apiBase/newtv/player.php?id=$targetId&hd=on"
+                        var playerRaw: String? = null
+                        try {
+                            playerRaw = app.get(playerUrl, headers = playerHeaders, timeout = 8).text
+                        } catch (_: Throwable) {}
+
+                        // If token expired or blank, refresh token once and retry
+                        if (playerRaw.isNullOrBlank() || playerRaw.contains("Invalid User") || playerRaw.contains("error")) {
+                            userToken = NetMirrorResolver.getUserToken(app, apiBase, force = true)
+                            if (userToken != null) {
+                                val retryHeaders = NetMirrorResolver.baseHeaders + mapOf(
+                                    "Usertoken" to userToken!!,
+                                    "Ott" to ott
                                 )
+                                try {
+                                    playerRaw = app.get(playerUrl, headers = retryHeaders, timeout = 8).text
+                                } catch (_: Throwable) {}
                             }
                         }
+
+                        if (!playerRaw.isNullOrBlank()) {
+                            // A. Try parsing NewTvPlayerResponse (video_link)
+                            val playerObj = tryParseJson<NewTvPlayerResponse>(playerRaw)
+                            val videoLink = playerObj?.video_link?.trim()
+                            if (!videoLink.isNullOrBlank()) {
+                                val streamReferer = playerObj.referer?.trim() ?: "https://net52.cc"
+                                val streamHeaders = mapOf(
+                                    "User-Agent" to "Mozilla/5.0 (Linux; Android 13; Pixel 5 Build/TQ3A.230901.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 Safari/537.36 /OS.Gatu v3.0",
+                                    "Referer" to streamReferer
+                                )
+                                val link = newExtractorLink(
+                                    source = "WaveFlix [NetMirror]",
+                                    name = "NetMirror - 1080p [Fast CDN ⚡]",
+                                    url = videoLink,
+                                    type = ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = streamReferer
+                                    this.headers = streamHeaders
+                                    this.quality = Qualities.P1080.value
+                                }
+                                selfHealingCallback(link)
+                                return true
+                            }
+
+                            // B. Try parsing PlayList array (multi-res MP4 + Tracks)
+                            val playList = tryParseJson<List<NewTvPlayListItem>>(playerRaw)
+                            var foundPlayListLink = false
+                            playList?.forEach { item ->
+                                item.sources?.forEach { s ->
+                                    val sFile = s.file?.trim()
+                                    if (!sFile.isNullOrBlank()) {
+                                        foundPlayListLink = true
+                                        val resLabel = s.label ?: "1080p"
+                                        val isM3u8 = sFile.contains(".m3u8")
+                                        val link = newExtractorLink(
+                                            source = "WaveFlix [NetMirror]",
+                                            name = "NetMirror - $resLabel [Fast CDN ⚡]",
+                                            url = sFile,
+                                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                                        ) {
+                                            this.referer = "https://net52.cc"
+                                            this.headers = NetMirrorResolver.baseHeaders
+                                            this.quality = parseQuality(resLabel)
+                                        }
+                                        selfHealingCallback(link)
+                                    }
+                                }
+                                item.tracks?.forEach { t ->
+                                    val tFile = t.file?.trim()
+                                    if (!tFile.isNullOrBlank()) {
+                                        val cleanTUrl = if (!tFile.contains(".srt") && !tFile.contains(".vtt")) "$tFile#.srt" else tFile
+                                        if (seenSubUrls.add(cleanTUrl)) {
+                                            subtitleCallback(
+                                                newSubtitleFile(
+                                                    lang = t.label ?: "English",
+                                                    url = cleanTUrl
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            if (foundPlayListLink) return true
+                        }
+                        return false
+                    }
+
+                    // Search across NetMirror Prime (pv) & OTT endpoints
+                    val ottEngines = listOf("pv")
+                    for (ott in ottEngines) {
+                        try {
+                            val searchUrl = "https://net52.cc/mobile/$ott/search.php?s=${URLEncoder.encode(cleanTitle, "UTF-8")}"
+                            val searchRes = app.get(searchUrl, headers = NetMirrorResolver.baseHeaders, timeout = 6).text
+                            val searchData = tryParseJson<NetMirrorSearchResponse>(searchRes)
+                            val items = searchData?.searchResult ?: emptyList()
+
+                            // Match title
+                            val match = items.firstOrNull { item ->
+                                val itT = item.t?.trim() ?: ""
+                                val itR = item.r?.trim() ?: ""
+                                val titleMatches = itT.equals(cleanTitle, ignoreCase = true) ||
+                                        itT.contains(cleanTitle, ignoreCase = true) ||
+                                        cleanTitle.contains(itT, ignoreCase = true)
+                                if (!titleMatches) return@firstOrNull false
+                                if (isMovie) {
+                                    !itR.contains("Series", ignoreCase = true)
+                                } else {
+                                    itR.contains("Series", ignoreCase = true)
+                                }
+                            } ?: items.firstOrNull { item ->
+                                val itT = item.t?.trim() ?: ""
+                                itT.equals(cleanTitle, ignoreCase = true)
+                            }
+
+                            if (match?.id != null) {
+                                if (tryPlayer(match.id, ott)) break
+                            }
+                        } catch (_: Throwable) {}
+                    }
+                }
+
+                // Fallback: Legacy NetMirror embed-tmdb endpoint on active mirror
+                if (tmdbId != null) {
+                    val mirrorHosts = listOf("https://net52.cc", "https://net22.cc", "https://net77.cc")
+                    for (host in mirrorHosts) {
+                        try {
+                            val netMirrorUrl = if (isMovie) {
+                                "$host/api/embed-tmdb/$tmdbId"
+                            } else {
+                                "$host/api/embed-tmdb/$tmdbId?type=tv&se=$season&ep=$episode"
+                            }
+                            val netHeaders = mapOf(
+                                "User-Agent" to browserUserAgent,
+                                "Referer" to "$host/"
+                            )
+                            val netRes = app.get(netMirrorUrl, headers = netHeaders, timeout = 4).text
+                            val netObj = tryParseJson<NetMirrorResponse>(netRes)
+                            if (netObj?.ok == true && !netObj.streams.isNullOrEmpty()) {
+                                netObj.streams.forEach { s ->
+                                    val streamUrl = s.url?.trim()
+                                    if (!streamUrl.isNullOrBlank()) {
+                                        val resLabel = s.resolution?.toString() ?: "720"
+                                        val streamHeaders = mapOf(
+                                            "User-Agent" to browserUserAgent,
+                                            "Referer" to "https://videodownloader.site/"
+                                        )
+                                        val link = newExtractorLink(
+                                            source = "WaveFlix [NetMirror]",
+                                            name = "NetMirror - ${resLabel}p [Fast CDN ⚡]",
+                                            url = streamUrl,
+                                            type = ExtractorLinkType.VIDEO
+                                        ) {
+                                            this.referer = "https://videodownloader.site/"
+                                            this.headers = streamHeaders
+                                            this.quality = parseQuality("${resLabel}p")
+                                        }
+                                        selfHealingCallback(link)
+                                    }
+                                }
+                                netObj.captions?.forEach { cap ->
+                                    val capUrl = cap.url?.trim()
+                                    if (!capUrl.isNullOrBlank()) {
+                                        val cleanCapUrl = if (!capUrl.contains(".srt") && !capUrl.contains(".vtt")) "$capUrl#.srt" else capUrl
+                                        if (seenSubUrls.add(cleanCapUrl)) {
+                                            subtitleCallback(
+                                                newSubtitleFile(
+                                                    lang = cap.name ?: cap.lang ?: "English",
+                                                    url = cleanCapUrl
+                                                )
+                                            )
+                                        }
+                                    }
+                                }
+                                break
+                            }
+                        } catch (_: Throwable) {}
                     }
                 }
             } catch (_: Throwable) {}
@@ -2174,7 +2316,63 @@ class WaveFlixProvider : MainAPI() {
         @JsonProperty("uri") val uri: String? = null
     )
 
-    // NetMirror DTOs
+    // NetMirror / NewTV DTOs & Dynamic Engine
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NewTvTokenResponse(
+        @JsonProperty("token_hash") val token_hash: String? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NewTvOtpResponse(
+        @JsonProperty("usertoken") val usertoken: String? = null,
+        @JsonProperty("status") val status: String? = null,
+        @JsonProperty("otp") val otp: String? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NewTvPlayerResponse(
+        @JsonProperty("status") val status: String? = null,
+        @JsonProperty("ott") val ott: String? = null,
+        @JsonProperty("video_link") val video_link: String? = null,
+        @JsonProperty("referer") val referer: String? = null,
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("ep") val ep: String? = null,
+        @JsonProperty("ep_title") val ep_title: String? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NewTvPlayListSource(
+        @JsonProperty("file") val file: String? = null,
+        @JsonProperty("label") val label: String? = null,
+        @JsonProperty("type") val type: String? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NewTvPlayListTrack(
+        @JsonProperty("file") val file: String? = null,
+        @JsonProperty("label") val label: String? = null,
+        @JsonProperty("kind") val kind: String? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NewTvPlayListItem(
+        @JsonProperty("sources") val sources: List<NewTvPlayListSource>? = null,
+        @JsonProperty("tracks") val tracks: List<NewTvPlayListTrack>? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NetMirrorSearchResponse(
+        @JsonProperty("searchResult") val searchResult: List<NetMirrorSearchResultItem>? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class NetMirrorSearchResultItem(
+        @JsonProperty("id") val id: String? = null,
+        @JsonProperty("t") val t: String? = null,
+        @JsonProperty("y") val y: String? = null,
+        @JsonProperty("r") val r: String? = null
+    )
+
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class NetMirrorResponse(
         @JsonProperty("ok") val ok: Boolean? = null,
@@ -2195,6 +2393,108 @@ class WaveFlixProvider : MainAPI() {
         @JsonProperty("lang") val lang: String? = null,
         @JsonProperty("name") val name: String? = null
     )
+
+    object NetMirrorResolver {
+        private val MOBIDETECT_DOMAINS = listOf(
+            "https://mobidetect.cc",
+            "https://mobidetects.xyz",
+            "https://mobidetects.com",
+            "https://mobidetect.app",
+            "https://mobidetect.art",
+            "https://mobidetect.click",
+            "https://mobidetect.ink",
+            "https://mobidetect.live",
+            "https://mobidetect.pro",
+            "https://mobidetect.shop",
+            "https://mobidetect.site",
+            "https://mobidetect.space",
+            "https://mobidetect.store",
+            "https://mobidetect.top",
+            "https://mobidetect.vip",
+            "https://mobidetect.wiki"
+        )
+
+        private const val DEFAULT_API_BASE = "https://tv.imgcdn.kim"
+        private var cachedApiBase: String? = null
+        private var apiBaseResolvedAt = 0L
+        private const val API_BASE_TTL_MS = 60 * 60 * 1000L // 1 hour
+
+        private var cachedUserToken: String? = null
+        private var userTokenCreatedAt = 0L
+        private const val USER_TOKEN_TTL_MS = 25 * 60 * 1000L // 25 minutes
+
+        val baseHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0 /OS.Gatu v1.0",
+            "Accept" to "application/json, text/plain, */*",
+            "X-Requested-With" to "NetmirrorNewTV v1.0"
+        )
+
+        suspend fun resolveApiBase(client: com.lagradost.nicehttp.Requests): String {
+            val now = System.currentTimeMillis()
+            if (cachedApiBase != null && (now - apiBaseResolvedAt) < API_BASE_TTL_MS) {
+                return cachedApiBase!!
+            }
+
+            for (domain in MOBIDETECT_DOMAINS) {
+                try {
+                    val res = client.get(
+                        "$domain/checknewtv.php",
+                        headers = baseHeaders + mapOf(
+                            "Cache-Control" to "no-cache, no-store, must-revalidate",
+                            "Pragma" to "no-cache"
+                        ),
+                        timeout = 5
+                    ).text
+                    val tokenObj = tryParseJson<NewTvTokenResponse>(res)
+                    val tokenHash = tokenObj?.token_hash
+                    if (!tokenHash.isNullOrBlank()) {
+                        val decodedBytes = try {
+                            Base64.decode(tokenHash, Base64.DEFAULT)
+                        } catch (_: Throwable) {
+                            java.util.Base64.getDecoder().decode(tokenHash)
+                        }
+                        val resolved = String(decodedBytes, Charsets.UTF_8).trimEnd('/')
+                        if (resolved.startsWith("http")) {
+                            cachedApiBase = resolved
+                            apiBaseResolvedAt = now
+                            return resolved
+                        }
+                    }
+                } catch (_: Throwable) {}
+            }
+
+            cachedApiBase = DEFAULT_API_BASE
+            apiBaseResolvedAt = now
+            return DEFAULT_API_BASE
+        }
+
+        suspend fun getUserToken(client: com.lagradost.nicehttp.Requests, apiBase: String, force: Boolean = false): String? {
+            val now = System.currentTimeMillis()
+            if (!force && cachedUserToken != null && (now - userTokenCreatedAt) < USER_TOKEN_TTL_MS) {
+                return cachedUserToken
+            }
+
+            val otpHeaders = baseHeaders + mapOf(
+                "Connection" to "Keep-Alive",
+                "expires" to "0",
+                "otp" to "111111",
+                "pragma" to "no-cache",
+                "Cache-Control" to "no-cache, no-store, must-revalidate"
+            )
+
+            try {
+                val res = client.get("$apiBase/newtv/otp.php", headers = otpHeaders, timeout = 7).text
+                val otpObj = tryParseJson<NewTvOtpResponse>(res)
+                if (otpObj?.status == "ok" && !otpObj.usertoken.isNullOrBlank()) {
+                    cachedUserToken = otpObj.usertoken
+                    userTokenCreatedAt = now
+                    return otpObj.usertoken
+                }
+            } catch (_: Throwable) {}
+
+            return cachedUserToken
+        }
+    }
 
     // Vidlink DTOs
     @JsonIgnoreProperties(ignoreUnknown = true)
