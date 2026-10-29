@@ -266,43 +266,8 @@ class WaveFlixProvider : MainAPI() {
             val isZipInName = link.name.contains(".zip", ignoreCase = true) || link.name.contains(".rar", ignoreCase = true)
 
             if (!isArchive && !isZipInName && !isLandingPage && !isExactDuplicate && !isFileDuplicate && rawUrl.startsWith("http")) {
-                // 4. Dynamic Audio Tagging: Ensure link name indicates audio language (Multi/Dual/Hindi/Eng)
-                val currentName = link.name
-                val hasExistingAudio = currentName.contains("Audio", ignoreCase = true) ||
-                                       currentName.contains("Hindi", ignoreCase = true) ||
-                                       currentName.contains("English", ignoreCase = true) ||
-                                       currentName.contains("Tamil", ignoreCase = true) ||
-                                       currentName.contains("Telugu", ignoreCase = true) ||
-                                       currentName.contains("Dub", ignoreCase = true)
-
-                val finalName = if (!hasExistingAudio) {
-                    val extractedAudio = when {
-                        rawUrl.contains("vidbolt") || rawUrl.contains("hakunabolt") || rawUrl.contains("hakunaymatata") -> "[Multi-Audio ⚡ Direct]"
-                        rawUrl.contains("vidlink") -> "[Multi-Audio ⚡]"
-                        else -> extractAudioTag(rawUrl, link.referer, link.source)
-                    }
-                    if (extractedAudio.isNotBlank()) {
-                        "$currentName $extractedAudio"
-                    } else currentName
-                } else currentName
-
-                val finalLink = if (finalName != currentName) {
-                    newExtractorLink(
-                        source = link.source,
-                        name = finalName,
-                        url = link.url,
-                        type = link.type
-                    ) {
-                        this.referer = link.referer
-                        this.headers = link.headers
-                        this.quality = link.quality
-                    }
-                } else {
-                    link
-                }
-
                 synchronized(callback) {
-                    callback(finalLink)
+                    callback(link)
                 }
             }
         }
