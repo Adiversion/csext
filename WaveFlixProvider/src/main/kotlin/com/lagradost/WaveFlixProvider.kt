@@ -250,11 +250,14 @@ class WaveFlixProvider : MainAPI() {
                             lower.endsWith(".7z") || lower.endsWith(".tar") ||
                             lower.endsWith(".iso") || lower.endsWith(".exe")
 
-            // 2. Invariant: Discard ad-gate landing pages returning text/html
+            // 2. Invariant: Discard ad-gate landing pages returning text/html & non-streamable Google Drive download gates
             val isLandingPage = (lower.contains("pixel.hubcloud") && !lower.contains("link=")) ||
                                 lower.contains("gamerxyt.com/hubcloud.php") ||
                                 lower.contains("hubcloud.ist/drive/") ||
-                                lower.contains("tinyurl.com")
+                                lower.contains("tinyurl.com") ||
+                                lower.contains("drive.google.com") ||
+                                lower.contains("googleusercontent.com") ||
+                                lower.contains("docs.google.com")
 
             // 3. Deduplication: Prevent flooding the player queue with identical dead links & duplicate worker mirrors
             // Strip dynamic signed query parameters (AWS S3 CloudFront Policy/Signature/Key-Pair-Id, token timestamps)

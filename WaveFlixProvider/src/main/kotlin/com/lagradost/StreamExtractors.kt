@@ -677,30 +677,8 @@ open class HubcloudExtractor : ExtractorApi() {
                     }
                 }
                 href.contains("gpdl.") || btn.text().contains("10Gbps", ignoreCase = true) -> {
-                    // Resolve 10Gbps redirect chain: gpdl -> workers.dev -> cryptonewz.online/dl.php?link=<google_url>
-                    // Only emit if the underlying Google direct video link can be resolved, avoiding raw HTML in ExoPlayer
-                    runCatching {
-                        val headRes = app.get(href, headers = mapOf("User-Agent" to VCloudExtractor.USER_AGENT, "Referer" to phpBtn))
-                        val finalLoc = headRes.url
-                        val gLink = Regex("""[?&]link=(https?://[^"'\s&]+)""").find(finalLoc)?.groupValues?.get(1)
-                            ?: Regex("""[?&]link=(https?://[^"'\s&]+)""").find(headRes.text)?.groupValues?.get(1)
-
-                        if (!gLink.isNullOrBlank()) {
-                            val gAudio = extractAudioTag(gLink, audioTag)
-                            val gFinalAudio = if (gAudio.isNotBlank()) " $gAudio" else audioTag
-                            callback(
-                                newExtractorLink(
-                                    source = name,
-                                    name = "$name - [Server 10Gbps : Unbuffered Direct]$displayQ$gFinalAudio",
-                                    url = gLink,
-                                    type = ExtractorLinkType.VIDEO
-                                ) {
-                                    this.referer = ""
-                                    this.quality = finalQ
-                                }
-                            )
-                        }
-                    }
+                    // Google Drive 10Gbps links are download-only gates (quota limits/browser interstitials, not streamable)
+                    // Discard to ensure only genuine, seekable media streams are dispatched to ExoPlayer
                 }
             }
         }
