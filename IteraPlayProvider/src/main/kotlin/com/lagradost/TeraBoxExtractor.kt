@@ -4,6 +4,8 @@ import android.content.Context
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import java.net.URLEncoder
 
 open class TeraBoxExtractor : ExtractorApi() {
     override val name = "TeraBox"
@@ -90,6 +92,14 @@ open class TeraBoxExtractor : ExtractorApi() {
             }
         }
 
+        fun extractSurl(rawUrl: String): String? {
+            var surl = Regex("""(?:/s/|surl=)([a-zA-Z0-9_\-]+)""").find(rawUrl)?.groupValues?.get(1) ?: return null
+            if (surl.startsWith("1") && surl.length == 23) {
+                surl = surl.substring(1)
+            }
+            return surl
+        }
+
         suspend fun getSessionCookies(): String {
             if (!cachedSessionCookies.isNullOrBlank()) return cachedSessionCookies!!
             return runCatching {
@@ -116,21 +126,98 @@ open class TeraBoxExtractor : ExtractorApi() {
         val cleanUrl = url.trim()
         val ndus = getSavedNdus()
 
-        // 1. Direct TeraBox Mode: If user has configured an ndus session token
+        // 1. Direct TeraBox Mode: If user has configured an ndus session token (high-speed dlink mp4)
         if (!ndus.isNullOrBlank()) {
             val resolvedDirect = resolveDirectTeraBox(cleanUrl, ndus, callback)
             if (resolvedDirect) return
         }
 
-        // 2. Custom Gateway Mode (e.g. saahiyo/terabox-gateway worker):
+        // 2. Direct TeraBox Native HLS Streaming (100% Free, NO Rate Limits, NO Login)
+        resolveDirectTeraBoxHls(cleanUrl, callback)
+
+        // 3. Custom Gateway Mode (e.g. saahiyo/terabox-gateway worker):
         val customWorker = getSavedCustomWorker()
         if (!customWorker.isNullOrBlank()) {
             val resolvedCustom = resolveViaCustomWorker(cleanUrl, customWorker, callback)
             if (resolvedCustom) return
         }
 
-        // 3. High-Performance HLS Worker Stream (Auto-handshake)
+        // 4. Bonus Transcode Worker for 720p/1080p HD (subject to guest limit)
         resolveViaTranscodeWorker(cleanUrl, subtitleCallback, callback)
+    }
+
+    private suspend fun resolveDirectTeraBoxHls(
+        rawUrl: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return runCatching {
+            val surl = extractSurl(rawUrl) ?: return false
+            val pageUrl = "https://www.terabox.app/sharing/link?surl=$surl"
+            val pageRes = app.get(
+                pageUrl,
+                headers = mapOf("User-Agent" to USER_AGENT),
+                timeout = 10
+            )
+            val html = pageRes.text
+            val cookies = pageRes.headers
+                .filter { it.first.equals("set-cookie", ignoreCase = true) }
+                .map { it.second.substringBefore(";").trim() }
+                .filter { it.isNotBlank() }
+                .joinToString("; ")
+
+            val stateJson = Regex("""window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*<\/script>""").find(html)?.groupValues?.get(1)
+                ?: return false
+            val root = parseJson<Map<String, Any?>>(stateJson)
+            val pinia = root["pinia"] as? Map<*, *> ?: return false
+            val share = pinia["share"] as? Map<*, *> ?: return false
+            val sInfo = share["shareInfo"] as? Map<*, *> ?: return false
+            val fileInfo = sInfo["fileInfo"] as? Map<*, *> ?: return false
+
+            val sign = sInfo["sign"]?.toString() ?: return false
+            val timestamp = sInfo["timestamp"]?.toString() ?: return false
+            val shareid = sInfo["shareid"]?.toString() ?: return false
+            val uk = sInfo["uk"]?.toString() ?: return false
+            val path = fileInfo["path"]?.toString() ?: return false
+            val fid = fileInfo["fs_id"]?.toString() ?: return false
+            val filename = fileInfo["server_filename"]?.toString() ?: "TeraBox Video"
+
+            var found = false
+            val qualities = listOf("M3U8_AUTO_480" to Qualities.P480, "M3U8_AUTO_360" to Qualities.P360)
+            for (q in qualities) {
+                val encodedPath = URLEncoder.encode(path, "UTF-8")
+                val streamUrl = "https://www.terabox.app/share/streaming?app_id=250528&channel=dubox&clienttype=0&web=1&type=${q.first}&path=$encodedPath&shareid=$shareid&uk=$uk&fid=$fid&sign=$sign&timestamp=$timestamp"
+                val probe = app.get(
+                    streamUrl,
+                    headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to pageUrl,
+                        "Cookie" to cookies
+                    ),
+                    timeout = 6
+                )
+                if (probe.text.contains("#EXTM3U")) {
+                    found = true
+                    val qNum = q.first.replace("M3U8_AUTO_", "")
+                    callback(
+                        newExtractorLink(
+                            source = "TeraBox Direct",
+                            name = "$filename - [TeraBox Direct ${qNum}p 🟢]",
+                            url = streamUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "https://www.terabox.app/"
+                            this.quality = q.second.value
+                            this.headers = mapOf(
+                                "Cookie" to cookies,
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to pageUrl
+                            )
+                        }
+                    )
+                }
+            }
+            found
+        }.getOrDefault(false)
     }
 
     private suspend fun resolveViaCustomWorker(
@@ -139,7 +226,7 @@ open class TeraBoxExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         return runCatching {
-            val surl = Regex("""(?:/s/|surl=)(?:1)?([a-zA-Z0-9_\-]+)""").find(rawUrl)?.groupValues?.get(1) ?: return false
+            val surl = extractSurl(rawUrl) ?: return false
             val baseWorker = workerUrl.trimEnd('/')
             val streamUrl = "$baseWorker/?mode=stream&surl=$surl&type=M3U8_AUTO_720"
             callback(
@@ -163,7 +250,7 @@ open class TeraBoxExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         return runCatching {
-            val surl = Regex("""(?:/s/|surl=)(?:1)?([a-zA-Z0-9_\-]+)""").find(rawUrl)?.groupValues?.get(1) ?: return false
+            val surl = extractSurl(rawUrl) ?: return false
             val listUrl = "https://www.terabox.app/share/list?app_id=250528&shorturl=$surl&root=1"
             val headers = mapOf(
                 "User-Agent" to USER_AGENT,

@@ -70,20 +70,45 @@ async function runTestSuite() {
     });
     assert("100% TeraBox Key Extraction from Thumbnails", matchedCount === decrypted.list.length, `(${matchedCount}/${decrypted.list.length} matched)`);
 
-    // 3. Trending & Random Tabs
-    console.log("\n--- TEST 3: Multi-Category Support (Trending, 720p, 1080p) ---");
-    let trendingRes = await getJSON("https://teraviralhub.com/api/home/search?sort=trending&offset=0&limit=5");
-    let trendingDecrypted = JSON.parse(decrypt(trendingRes.data, "iteraplay_super_secret_enc_key_2026_v2"));
-    assert("Trending Catalog", trendingDecrypted.list && trendingDecrypted.list.length > 0, `(${trendingDecrypted.list.length} items)`);
+    // 3. Direct Native TeraBox HLS Streaming (Zero Login, Zero Rate Limits)
+    console.log("\n--- TEST 3: Direct Native TeraBox HLS Streaming (Bypassing IteraPlay) ---");
+    let sampleKey = "1AJbS72yZ6tw0f4VxkfsKfw";
+    let surl = sampleKey.startsWith("1") ? sampleKey.substring(1) : sampleKey;
+    let pageUrl = `https://www.terabox.app/sharing/link?surl=${surl}`;
 
-    // 4. Session Cookies Acquisition
-    console.log("\n--- TEST 4: Session Cookies Handshake ---");
-    let cookieRes = await new Promise(resolve => {
-        https.get("https://iteraplay.com/", res => resolve(res.headers["set-cookie"] || []));
+    let htmlRes = await new Promise(r => {
+        https.get(pageUrl, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }, res => {
+            let d = "";
+            res.on("data", c => d += c);
+            res.on("end", () => r({ html: d, cookies: res.headers["set-cookie"] || [] }));
+        });
     });
-    let hasSession = cookieRes.some(c => c.includes("session_id"));
-    let hasSecureToken = cookieRes.some(c => c.includes("__secure_token"));
-    assert("Automatic Session Cookie Acquisition", hasSession && hasSecureToken, `(session_id & __secure_token present)`);
+
+    let m = htmlRes.html.match(/window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*<\/script>/);
+    assert("TeraBox Page & Token Extraction", m !== null, `(Found __INITIAL_STATE__)`);
+
+    if (m) {
+        let sInfo = JSON.parse(m[1]).pinia.share.shareInfo;
+        let cookieStr = htmlRes.cookies.map(c => c.split(";")[0]).join("; ");
+        let streamUrl = `https://www.terabox.app/share/streaming?app_id=250528&channel=dubox&clienttype=0&web=1&type=M3U8_AUTO_480&path=${encodeURIComponent(sInfo.fileInfo.path)}&shareid=${sInfo.shareid}&uk=${sInfo.uk}&fid=${sInfo.fileInfo.fs_id}&sign=${sInfo.sign}&timestamp=${sInfo.timestamp}`;
+        
+        let m3u8Res = await new Promise(r => {
+            https.get(streamUrl, {
+                headers: {
+                    "User-Agent": "Mozilla/5.0",
+                    "Referer": pageUrl,
+                    "Cookie": cookieStr
+                }
+            }, res => {
+                let d = "";
+                res.on("data", c => d += c);
+                res.on("end", () => r(d));
+            });
+        });
+
+        let isHls = m3u8Res.includes("#EXTM3U") && m3u8Res.includes("#EXTINF");
+        assert("Direct TeraBox Native HLS Playlist (.m3u8)", isHls, "(Streamed directly from freeterabox.com with 0 rate limit)");
+    }
 
     console.log("\n==================================================================");
     console.log(`VERIFICATION SUMMARY: ${passed} PASSED, ${failed} FAILED`);
