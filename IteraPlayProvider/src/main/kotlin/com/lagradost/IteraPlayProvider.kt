@@ -26,7 +26,6 @@ class IteraPlayProvider : MainAPI() {
         private const val KEY_REMEMBER_ME = "remember_me_cookie"
 
         @Volatile var authCookie: String? = null
-        @Volatile private var sessionCookies: String? = null
 
         fun getSavedCookie(context: Context? = null): String? {
             if (!authCookie.isNullOrBlank()) return authCookie
@@ -51,22 +50,6 @@ class IteraPlayProvider : MainAPI() {
                 }
             }
         }
-    }
-
-    private suspend fun getSessionCookies(): String {
-        if (!sessionCookies.isNullOrBlank()) return sessionCookies!!
-        return runCatching {
-            val res = app.get("$mainUrl/", headers = mapOf("User-Agent" to USER_AGENT), timeout = 8)
-            val cookies = res.headers
-                .filter { it.first.equals("set-cookie", ignoreCase = true) }
-                .map { it.second.substringBefore(";").trim() }
-                .filter { it.isNotBlank() }
-                .joinToString("; ")
-            if (cookies.isNotBlank()) {
-                sessionCookies = cookies
-            }
-            cookies
-        }.getOrDefault("")
     }
 
     override val mainPage = mainPageOf(
@@ -166,68 +149,58 @@ class IteraPlayProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // A. Direct LinkData passed from search:
-        if (url.startsWith("{") && url.endsWith("}")) {
-            val linkData = runCatching { parseJson<IteraLinkData>(url) }.getOrNull()
-            if (linkData != null) {
-                return newMovieLoadResponse(
-                    name = linkData.title ?: "TeraBox Media",
-                    url = url,
-                    type = TvType.Movie,
-                    dataUrl = url
-                ) {
-                    this.posterUrl = linkData.poster ?: "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
-                    this.plot = "Direct TeraBox streaming media."
-                }
-            }
-        }
+        val linkData = if (url.startsWith("{") && url.endsWith("}")) {
+            runCatching { parseJson<IteraLinkData>(url) }.getOrNull()
+        } else null
 
-        // B. Standard /video/{id} URL:
-        val videoId = Regex("""/video/(\d+)""").find(url)?.groupValues?.get(1)?.toLongOrNull()
+        val videoId = linkData?.videoId ?: Regex("""/video/(\d+)""").find(url)?.groupValues?.get(1)?.toLongOrNull()
             ?: throw ErrorLoadingException("Invalid video URL: $url")
 
-        val cookie = getSavedCookie()
-        val accessUrl = "$mainUrl/api/video/access/$videoId"
-        val headers = mutableMapOf(
-            "Content-Type" to "application/json",
-            "User-Agent" to USER_AGENT,
-            "Referer" to "$mainUrl/"
-        )
-        if (!cookie.isNullOrBlank()) {
-            headers["Cookie"] = "remember_me=$cookie"
+        var teraboxUrl = linkData?.teraboxUrl
+        val title = linkData?.title ?: "Video #$videoId"
+        val poster = linkData?.poster ?: "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
+
+        // If terabox URL wasn't embedded in thumbnail, fallback to access API:
+        if (teraboxUrl.isNullOrBlank()) {
+            val cookie = getSavedCookie()
+            val accessUrl = "$mainUrl/api/video/access/$videoId"
+            val headers = mutableMapOf(
+                "Content-Type" to "application/json",
+                "User-Agent" to USER_AGENT,
+                "Referer" to "$mainUrl/"
+            )
+            if (!cookie.isNullOrBlank()) {
+                headers["Cookie"] = "remember_me=$cookie"
+            }
+            val accessRes = runCatching {
+                app.post(
+                    accessUrl,
+                    headers = headers,
+                    json = mapOf(
+                        "type" to "play",
+                        "fingerprint" to "1bb52e836da743a0bad8bfcdd8020526"
+                    ),
+                    timeout = 10
+                ).parsedSafe<IteraAccessResponse>()
+            }.getOrNull()
+            teraboxUrl = accessRes?.url
         }
 
-        val accessRes = runCatching {
-            app.post(
-                accessUrl,
-                headers = headers,
-                json = mapOf(
-                    "type" to "play",
-                    "fingerprint" to "1bb52e836da743a0bad8bfcdd8020526"
-                ),
-                timeout = 10
-            ).parsedSafe<IteraAccessResponse>()
-        }.getOrNull()
-
-        val teraboxUrl = accessRes?.url
-        val linkData = IteraLinkData(
+        val resolvedLinkData = IteraLinkData(
             videoId = videoId,
             teraboxUrl = teraboxUrl,
-            title = "Video #$videoId"
+            title = title,
+            poster = poster
         )
 
         return newMovieLoadResponse(
-            name = "Video #$videoId",
+            name = title,
             url = url,
             type = TvType.Movie,
-            dataUrl = linkData.toJson()
+            dataUrl = resolvedLinkData.toJson()
         ) {
-            this.posterUrl = "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
-            this.plot = if (teraboxUrl.isNullOrBlank() && cookie.isNullOrBlank()) {
-                "Guest playback limit reached. To watch unlimited videos, add your iteraplay 'remember_me' cookie in plugin settings."
-            } else {
-                "iTeraPlay Video stream #$videoId"
-            }
+            this.posterUrl = poster
+            this.plot = "TeraBox streaming video."
         }
     }
 
@@ -272,7 +245,7 @@ class IteraPlayProvider : MainAPI() {
             return false
         }
 
-        // Delegate to registered TeraBox extractors (supports Direct TeraBox, Custom Gateway, and Transcode Worker)
+        // Delegate to registered TeraBox extractors (TeraVideo Native HLS + LinkPlay 1080p MP4)
         var foundLinks = false
         val customCallback: (ExtractorLink) -> Unit = { link ->
             foundLinks = true
@@ -283,104 +256,6 @@ class IteraPlayProvider : MainAPI() {
             loadExtractor(teraboxUrl, subtitleCallback, customCallback)
         }
 
-        if (foundLinks) {
-            return true
-        }
-
-        // Fallback: Direct internal call to /api/stream if extractor was not invoked
-        var cookies = getSessionCookies()
-        val auth = getSavedCookie()
-        val combinedCookie = listOfNotNull(
-            cookies.ifBlank { null },
-            if (!auth.isNullOrBlank()) "remember_me=$auth" else null
-        ).joinToString("; ")
-
-        val streamHeaders = mutableMapOf(
-            "Content-Type" to "application/json",
-            "User-Agent" to USER_AGENT,
-            "Origin" to mainUrl,
-            "Referer" to "$mainUrl/"
-        )
-        if (combinedCookie.isNotBlank()) {
-            streamHeaders["Cookie"] = combinedCookie
-        }
-
-        var streamRes = runCatching {
-            app.post(
-                "$mainUrl/api/stream",
-                headers = streamHeaders,
-                json = mapOf("url" to teraboxUrl),
-                timeout = 15
-            ).parsedSafe<IteraStreamResponse>()
-        }.getOrNull()
-
-        // Self-Healing token refresh if verification token expired
-        if (streamRes?.status != "success") {
-            CommonActivity.activity?.let { act ->
-                act.runOnUiThread {
-                    android.widget.Toast.makeText(
-                        act,
-                        "iTeraPlay: Guest limit (5 videos/6h) reached. Switch mobile data or login in settings.",
-                        android.widget.Toast.LENGTH_LONG
-                    ).show()
-                }
-            }
-            sessionCookies = null
-            cookies = getSessionCookies()
-            val retryCookie = listOfNotNull(
-                cookies.ifBlank { null },
-                if (!auth.isNullOrBlank()) "remember_me=$auth" else null
-            ).joinToString("; ")
-            if (retryCookie.isNotBlank()) {
-                streamHeaders["Cookie"] = retryCookie
-            }
-            streamRes = runCatching {
-                app.post(
-                    "$mainUrl/api/stream",
-                    headers = streamHeaders,
-                    json = mapOf("url" to teraboxUrl),
-                    timeout = 15
-                ).parsedSafe<IteraStreamResponse>()
-            }.getOrNull()
-        }
-
-        foundLinks = false
-        streamRes?.list?.forEach { file ->
-            val fastStreams = file.fastStreamUrl ?: return@forEach
-            fastStreams.forEach { (qualityKey, m3u8Url) ->
-                if (m3u8Url.isNotBlank() && m3u8Url.startsWith("http")) {
-                    foundLinks = true
-                    val qValue = when {
-                        qualityKey.contains("1080") -> Qualities.P1080.value
-                        qualityKey.contains("720")  -> Qualities.P720.value
-                        qualityKey.contains("480")  -> Qualities.P480.value
-                        qualityKey.contains("360")  -> Qualities.P360.value
-                        else -> Qualities.Unknown.value
-                    }
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "${file.name ?: "Video"} - [$qualityKey ⚡]",
-                            url = m3u8Url,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "$mainUrl/"
-                            this.quality = qValue
-                        }
-                    )
-                }
-            }
-
-            if (!file.subtitleUrl.isNullOrBlank() && file.subtitleUrl.startsWith("http")) {
-                subtitleCallback(
-                    SubtitleFile(
-                        lang = "English (AI)",
-                        url = file.subtitleUrl
-                    )
-                )
-            }
-        }
-
         return foundLinks
     }
 
@@ -388,7 +263,8 @@ class IteraPlayProvider : MainAPI() {
         val id = this.id ?: return null
         val title = this.fileName?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "Video #$id"
         val thumb = this.thumbnail ?: ""
-        val teraboxKey = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{22})_""").find(thumb)?.groupValues?.get(1)
+        val teraboxKey = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
+            ?: Regex("""(?:fid=|\/)([a-zA-Z0-9_\-]{15,})""").find(thumb)?.groupValues?.get(1)
         val teraboxUrl = if (teraboxKey != null) "https://terabox.app/s/$teraboxKey" else null
 
         val linkData = IteraLinkData(
@@ -441,25 +317,6 @@ data class IteraAccessResponse(
     @JsonProperty("terabox_id") val teraboxId: String? = null,
     @JsonProperty("type") val type: String? = null,
     @JsonProperty("error") val error: String? = null
-)
-
-data class IteraStreamResponse(
-    @JsonProperty("status") val status: String? = null,
-    @JsonProperty("total_files") val totalFiles: Int? = null,
-    @JsonProperty("list") val list: List<IteraStreamItem>? = null
-)
-
-data class IteraStreamItem(
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("file_path") val filePath: String? = null,
-    @JsonProperty("size") val size: Long? = null,
-    @JsonProperty("size_formatted") val sizeFormatted: String? = null,
-    @JsonProperty("type") val type: String? = null,
-    @JsonProperty("duration") val duration: String? = null,
-    @JsonProperty("quality") val quality: String? = null,
-    @JsonProperty("fast_stream_url") val fastStreamUrl: Map<String, String>? = null,
-    @JsonProperty("subtitle_url") val subtitleUrl: String? = null,
-    @JsonProperty("thumbnail") val thumbnail: String? = null
 )
 
 data class IteraLinkData(

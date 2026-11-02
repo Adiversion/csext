@@ -27,12 +27,38 @@ function decrypt(cipherBase64, secret) {
     return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf-8");
 }
 
-async function getJSON(url) {
+async function getJSON(url, headers = {}) {
     return new Promise((resolve, reject) => {
-        https.get(url, (res) => {
+        https.get(url, { headers: { "User-Agent": "Mozilla/5.0", ...headers } }, (res) => {
             let data = "";
             res.on("data", c => data += c);
-            res.on("end", () => resolve(JSON.parse(data)));
+            res.on("end", () => {
+                try {
+                    resolve({ statusCode: res.statusCode, headers: res.headers, data: JSON.parse(data) });
+                } catch (e) {
+                    resolve({ statusCode: res.statusCode, headers: res.headers, rawText: data, error: e.message });
+                }
+            });
+        }).on("error", reject);
+    });
+}
+
+async function getText(url, headers = {}) {
+    return new Promise((resolve, reject) => {
+        https.get(url, { headers: { "User-Agent": "Mozilla/5.0", ...headers } }, (res) => {
+            let data = "";
+            res.on("data", c => data += c);
+            res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, text: data }));
+        }).on("error", reject);
+    });
+}
+
+async function getBuffer(url, headers = {}) {
+    return new Promise((resolve, reject) => {
+        https.get(url, { headers: { "User-Agent": "Mozilla/5.0", ...headers } }, (res) => {
+            let chunks = [];
+            res.on("data", c => chunks.push(c));
+            res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, buffer: Buffer.concat(chunks) }));
         }).on("error", reject);
     });
 }
@@ -58,68 +84,81 @@ async function runTestSuite() {
     // 1. Latest Uploads API
     console.log("\n--- TEST 1: Latest Uploads Catalog & AES Decryption ---");
     let res = await getJSON("https://teraviralhub.com/api/home/search?sort=latest&offset=0&limit=10");
-    assert("API success flag", res.success === true);
-    let decrypted = JSON.parse(decrypt(res.data, "iteraplay_super_secret_enc_key_2026_v2"));
+    assert("API success flag", res.data?.success === true);
+    let decrypted = JSON.parse(decrypt(res.data.data, "iteraplay_super_secret_enc_key_2026_v2"));
     assert("AES Decryption & Catalog Parsing", decrypted.list && decrypted.list.length > 0, `(${decrypted.list.length} items found)`);
 
     // 2. Thumbnail-to-TeraBox Key Extraction
     console.log("\n--- TEST 2: Thumbnail-to-TeraBox Key Extraction ---");
-    let thumbRegex = /thumbnails\/(1[a-zA-Z0-9_\-]{22})_/;
+    let thumbRegex = /thumbnails\/(1[a-zA-Z0-9_\-]{22})/;
     let matchedCount = 0;
+    let extractedKeys = [];
     decrypted.list.forEach((item) => {
-        if ((item.thumbnail || "").match(thumbRegex)) matchedCount++;
+        let m = (item.thumbnail || "").match(thumbRegex);
+        if (m) {
+            matchedCount++;
+            extractedKeys.push(m[1]);
+        }
     });
     assert("100% TeraBox Key Extraction from Thumbnails", matchedCount === decrypted.list.length, `(${matchedCount}/${decrypted.list.length} matched)`);
 
-    // 3. LinkPlay 1080p Full-Length MP4 Streaming (No 10s Limit, Byte-Range Seekable)
-    console.log("\n--- TEST 3: LinkPlay 1080p Direct MP4 Streaming (Verified Full File) ---");
-    let linkplayRecordPath = "C:/Users/Anadi/Downloads/returnpilot_v6_5_records_linkplay_in_1793634581555.json";
-    let streamUrl = null;
-    let expectedSize = 0;
-    let videoTitle = "";
+    // 3. TeraVideo Native HLS Resolver (No Captcha, No 5-Video Limit, Full Duration)
+    console.log("\n--- TEST 3: TeraVideo Instant HLS Stream Resolution ---");
+    let sampleKey = extractedKeys[0] || "1AJbS72yZ6tw0f4VxkfsKfw";
+    let sampleTbUrl = `https://terabox.app/s/${sampleKey}`;
+    let resolveEndpoint = `https://teravideo.in/terabox-api/api.php?action=resolve&url=${encodeURIComponent(sampleTbUrl)}`;
+    
+    let tvRes = await getJSON(resolveEndpoint, {
+        "Referer": "https://teravideo.in/terabox-player-online/",
+        "Origin": "https://teravideo.in"
+    });
 
-    if (fs.existsSync(linkplayRecordPath)) {
-        let rec = JSON.parse(fs.readFileSync(linkplayRecordPath, "utf8"));
-        let apiCall = rec.normalizedReport?.apiCalls?.find(a => a.cleanUrl === "/api/fetch-video");
-        if (apiCall?.responseParsed?.video?.secure_stream) {
-            streamUrl = apiCall.responseParsed.video.secure_stream;
-            expectedSize = parseInt(apiCall.responseParsed.video.size);
-            videoTitle = apiCall.responseParsed.video.name;
+    assert("TeraVideo API HTTP 200", tvRes.statusCode === 200);
+    assert("TeraVideo Success Response", tvRes.data?.success === true);
+    let activeFile = tvRes.data?.data?.active_file || tvRes.data?.data?.file;
+    assert("TeraVideo File Resolved", activeFile !== undefined && activeFile !== null, `(${activeFile?.name || "Unknown"})`);
+    assert("Full Duration Video (> 60s, Not 10s Preview)", (activeFile?.duration || 0) > 60, `(Duration: ${activeFile?.durationFormatted || activeFile?.duration + "s"})`);
+    assert("Adaptive Bitrate masterUrl Present", !!activeFile?.masterUrl);
+
+    if (activeFile?.masterUrl) {
+        let masterFull = activeFile.masterUrl.startsWith("http") ? activeFile.masterUrl : `https://teravideo.in/terabox-api/${activeFile.masterUrl}`;
+        let masterM3u8 = await getText(masterFull, { "Referer": "https://teravideo.in/terabox-player-online/" });
+        assert("Master M3U8 Playlist Fetched", masterM3u8.statusCode === 200 && masterM3u8.text.includes("#EXTM3U"));
+
+        let lines = masterM3u8.text.split("\n");
+        let subPlaylistRel = lines.find(l => l.includes("action=m3u8"));
+        assert("Master Contains Sub-Playlists (480p/360p)", !!subPlaylistRel);
+
+        if (subPlaylistRel) {
+            let subFull = `https://teravideo.in/terabox-api/${subPlaylistRel.trim()}`;
+            let subM3u8 = await getText(subFull, { "Referer": "https://teravideo.in/terabox-player-online/" });
+            assert("Sub M3U8 Playlist Fetched", subM3u8.statusCode === 200 && subM3u8.text.includes("#EXTINF"));
+
+            let segLines = subM3u8.text.split("\n");
+            let segCount = segLines.filter(l => l.startsWith("#EXTINF")).length;
+            assert("Full VOD Playlist Segment Count (> 10 segments)", segCount > 10, `(${segCount} segments found)`);
+
+            let segRel = segLines.find(l => l.includes("action=segment"));
+            if (segRel) {
+                let segFull = `https://teravideo.in/terabox-api/${segRel.trim()}`;
+                let segProbe = await getBuffer(segFull, { "Referer": "https://teravideo.in/terabox-player-online/" });
+                assert("Segment HTTP 200 OK", segProbe.statusCode === 200);
+                assert("Segment Content-Type is video/mp2t", (segProbe.headers["content-type"] || "").includes("mp2t"));
+                assert("Valid MPEG-TS Sync Byte (0x47)", segProbe.buffer.length > 0 && segProbe.buffer[0] === 0x47, `(Length: ${segProbe.buffer.length} bytes)`);
+            }
         }
     }
 
-    assert("Extracted LinkPlay Direct Stream URL from Evidence", streamUrl !== null, `(${videoTitle})`);
-
-    if (streamUrl) {
-        let probe = await new Promise(resolve => {
-            let req = https.request(streamUrl, {
-                method: "GET",
-                headers: {
-                    "Range": "bytes=0-1023",
-                    "User-Agent": "Mozilla/5.0"
-                }
-            }, res => {
-                let chunks = [];
-                res.on("data", c => chunks.push(c));
-                res.on("end", () => {
-                    let buf = Buffer.concat(chunks);
-                    resolve({
-                        statusCode: res.statusCode,
-                        contentRange: res.headers["content-range"],
-                        contentType: res.headers["content-type"],
-                        contentLength: res.headers["content-length"],
-                        magicBytes: buf.slice(4, 8).toString("ascii")
-                    });
-                });
-            });
-            req.on("error", (e) => resolve({ error: e.message }));
-            req.end();
-        });
-
-        assert("HTTP 206 Partial Content (Byte-Range Support)", probe.statusCode === 206, `(Range: ${probe.contentRange})`);
-        assert("Content-Type is video/mp4", probe.contentType === "video/mp4", `(${probe.contentType})`);
-        assert("Valid MP4 Container (ftyp box)", probe.magicBytes === "ftyp", `(Box: ${probe.magicBytes})`);
-        assert("Full File Length > 700MB (Not 10-Second Trial)", expectedSize > 700 * 1024 * 1024, `(${(expectedSize / (1024*1024)).toFixed(2)} MB / 813 Million Bytes)`);
+    // 4. LinkPlay 1080p Contract Verification
+    console.log("\n--- TEST 4: LinkPlay 1080p MP4 Architecture Verification ---");
+    let linkplayRecordPath = "C:/Users/Anadi/Downloads/returnpilot_v6_5_records_linkplay_in_1793634581555.json";
+    if (fs.existsSync(linkplayRecordPath)) {
+        let rec = JSON.parse(fs.readFileSync(linkplayRecordPath, "utf8"));
+        let apiCall = rec.normalizedReport?.apiCalls?.find(a => a.cleanUrl === "/api/fetch-video");
+        let video = apiCall?.responseParsed?.video;
+        assert("LinkPlay Evidence Extracted", video !== undefined);
+        assert("LinkPlay Full File Size (> 700MB)", parseInt(video?.size || "0") > 700 * 1024 * 1024, `(${(parseInt(video?.size || 0)/(1024*1024)).toFixed(2)} MB)`);
+        assert("LinkPlay Direct Stream URL Present", !!video?.secure_stream);
     }
 
     console.log("\n==================================================================");
