@@ -1,5 +1,6 @@
 rootProject.name = "CloudstreamPlugins"
 
-// Explicitly include AnimePaheProvider and WaveFlixProvider plugin modules
+// Explicitly include AnimePaheProvider, WaveFlixProvider, and IteraPlayProvider plugin modules
 include("AnimePaheProvider")
 include("WaveFlixProvider")
+include("IteraPlayProvider")

@@ -52,7 +52,7 @@ jobs:
           set +e
           for attempt in 1 2 3 4; do
             echo "Gradle build attempt $attempt of 4..."
-            ./gradlew :AnimePaheProvider:make :WaveFlixProvider:make makePluginsJson --no-daemon --stacktrace 2>&1 | tee build_output.log
+            ./gradlew :AnimePaheProvider:make :WaveFlixProvider:make :IteraPlayProvider:make makePluginsJson --no-daemon --stacktrace 2>&1 | tee build_output.log
             BUILD_STATUS=${PIPESTATUS[0]}
             if [ $BUILD_STATUS -eq 0 ]; then
               echo "Gradle build succeeded on attempt $attempt!"
@@ -83,12 +83,14 @@ jobs:
           find . -type f -name "*.cs3" -exec cp -v {} $GITHUB_WORKSPACE/builds/ \;
           cp $GITHUB_WORKSPACE/builds/AnimePaheProvider.cs3 $GITHUB_WORKSPACE/builds/AnimePahe.cs3 || true
           cp $GITHUB_WORKSPACE/builds/WaveFlixProvider.cs3 $GITHUB_WORKSPACE/builds/WaveFlix.cs3 || true
+          cp $GITHUB_WORKSPACE/builds/IteraPlayProvider.cs3 $GITHUB_WORKSPACE/builds/IteraPlay.cs3 || true
           find . -type f -name "plugins.json" -exec cp -v {} $GITHUB_WORKSPACE/builds/ \;
           cp repo.json $GITHUB_WORKSPACE/builds/repo.json || true
           cp icon.png $GITHUB_WORKSPACE/builds/icon.png || true
           cp logo.png $GITHUB_WORKSPACE/builds/logo.png || true
           cp AnimePaheProvider/icon.png $GITHUB_WORKSPACE/builds/AnimePahe_icon.png || true
           cp WaveFlixProvider/icon.png $GITHUB_WORKSPACE/builds/WaveFlix_icon.png || true
+          cp IteraPlayProvider/icon.png $GITHUB_WORKSPACE/builds/IteraPlay_icon.png || true
           cp build_output.log $GITHUB_WORKSPACE/builds/build_output.log || true
           echo "Builds contents:"
           ls -la $GITHUB_WORKSPACE/builds/
