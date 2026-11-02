@@ -224,7 +224,8 @@ open class TeraBoxExtractor : ExtractorApi() {
         if (activity.isFinishing || activity.isDestroyed) return false
 
         val latch = CountDownLatch(1)
-        var resolvedVideo: LinkPlayVideo? = null
+        var capturedToken: String? = null
+        var effectiveUa: String = USER_AGENT
 
         activity.runOnUiThread {
             try {
@@ -243,7 +244,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                 dialog.window?.decorView?.alpha = 0f
 
                 val handler = Handler(Looper.getMainLooper())
-                var tokenCaptured = false
+                var tokenSaved = false
 
                 val root = LinearLayout(activity).apply {
                     orientation = LinearLayout.VERTICAL
@@ -337,11 +338,12 @@ open class TeraBoxExtractor : ExtractorApi() {
                             } else ua
                         }
                     userAgentString = sanitizedUa
+                    effectiveUa = sanitizedUa
                 }
 
                 // Reveal dialog if user interaction (checkbox click) is needed after 2.2 seconds
                 val revealRunnable = Runnable {
-                    if (!tokenCaptured && dialog.isShowing) {
+                    if (!tokenSaved && dialog.isShowing) {
                         statusTv.text = "Please complete the verification checkmark below to start video."
                         runCatching {
                             dialog.window?.decorView?.animate()?.alpha(1f)?.setDuration(250L)?.start()
@@ -352,7 +354,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                 var pollElapsedMs = 0L
                 lateinit var pollRunnable: Runnable
                 pollRunnable = Runnable {
-                    if (tokenCaptured) return@Runnable
+                    if (tokenSaved) return@Runnable
                     pollElapsedMs += 500L
 
                     val checkJs = """
@@ -372,39 +374,13 @@ open class TeraBoxExtractor : ExtractorApi() {
                     webView.evaluateJavascript(checkJs) { rawVal ->
                         val token = rawVal?.trim('"', '\'')?.replace("\\", "")
                         if (!token.isNullOrBlank() && token.length > 20) {
-                            tokenCaptured = true
+                            tokenSaved = true
+                            capturedToken = token
                             handler.removeCallbacks(revealRunnable)
-
-                            Thread {
-                                try {
-                                    val postBody = mapOf(
-                                        "url" to fullTeraBoxUrl,
-                                        "turnstileToken" to token
-                                    )
-                                    val res = app.post(
-                                        "https://linkplay.in/api/fetch-video",
-                                        json = postBody,
-                                        headers = mapOf(
-                                            "User-Agent" to webView.settings.userAgentString,
-                                            "Referer" to "https://linkplay.in/",
-                                            "Origin" to "https://linkplay.in",
-                                            "Content-Type" to "application/json"
-                                        ),
-                                        timeout = 25
-                                    ).parsedSafe<LinkPlayResponse>()
-
-                                    if (res?.success == true && res.video != null) {
-                                        resolvedVideo = res.video
-                                    }
-                                } catch (e: Throwable) {
-                                    Log.e("TeraBox", "LinkPlay fetch-video error: ${e.message}")
-                                } finally {
-                                    activity.runOnUiThread {
-                                        runCatching { if (dialog.isShowing) dialog.dismiss() }
-                                    }
-                                    latch.countDown()
-                                }
-                            }.start()
+                            handler.postDelayed({
+                                runCatching { if (dialog.isShowing) dialog.dismiss() }
+                            }, 200L)
+                            latch.countDown()
                             return@evaluateJavascript
                         }
 
@@ -457,36 +433,57 @@ open class TeraBoxExtractor : ExtractorApi() {
             latch.await(45, TimeUnit.SECONDS)
         } catch (_: InterruptedException) {}
 
-        val video = resolvedVideo
-        val streamUrl = video?.secure_stream ?: video?.secure_download
-        if (!streamUrl.isNullOrBlank()) {
-            val videoName = video.name ?: "TeraBox Video"
-            val expires = Regex("""expires=(\d+)""").find(streamUrl)?.groupValues?.get(1)?.toLongOrNull()
-                ?: (System.currentTimeMillis() + 900_000L)
-            linkPlayCache[canonicalKey] = CachedStream(streamUrl, videoName, expires)
+        val token = capturedToken
+        if (token.isNullOrBlank()) return false
 
-            val q = when {
-                videoName.contains("1080", ignoreCase = true) || videoName.contains("4k", ignoreCase = true) -> Qualities.P1080.value
-                videoName.contains("720", ignoreCase = true) -> Qualities.P720.value
-                videoName.contains("480", ignoreCase = true) -> Qualities.P480.value
-                else -> Qualities.P1080.value
-            }
-
-            callback(
-                newExtractorLink(
-                    source = "LinkPlay Direct",
-                    name = "$videoName - [LinkPlay Direct MP4 ⚡]",
-                    url = streamUrl,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = "https://linkplay.in/"
-                    this.quality = q
-                }
+        return runCatching {
+            val postBody = mapOf(
+                "url" to fullTeraBoxUrl,
+                "turnstileToken" to token
             )
-            return true
-        }
+            val res = app.post(
+                "https://linkplay.in/api/fetch-video",
+                json = postBody,
+                headers = mapOf(
+                    "User-Agent" to effectiveUa,
+                    "Referer" to "https://linkplay.in/",
+                    "Origin" to "https://linkplay.in",
+                    "Content-Type" to "application/json"
+                ),
+                timeout = 25
+            ).parsedSafe<LinkPlayResponse>()
 
-        return false
+            val video = res?.video
+            val streamUrl = video?.secure_stream ?: video?.secure_download
+            if (res?.success == true && !streamUrl.isNullOrBlank()) {
+                val videoName = video.name ?: "TeraBox Video"
+                val expires = Regex("""expires=(\d+)""").find(streamUrl)?.groupValues?.get(1)?.toLongOrNull()
+                    ?: (System.currentTimeMillis() + 900_000L)
+                linkPlayCache[canonicalKey] = CachedStream(streamUrl, videoName, expires)
+
+                val q = when {
+                    videoName.contains("1080", ignoreCase = true) || videoName.contains("4k", ignoreCase = true) -> Qualities.P1080.value
+                    videoName.contains("720", ignoreCase = true) -> Qualities.P720.value
+                    videoName.contains("480", ignoreCase = true) -> Qualities.P480.value
+                    else -> Qualities.P1080.value
+                }
+
+                callback(
+                    newExtractorLink(
+                        source = "LinkPlay Direct",
+                        name = "$videoName - [LinkPlay Direct MP4 ⚡]",
+                        url = streamUrl,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "https://linkplay.in/"
+                        this.quality = q
+                    }
+                )
+                true
+            } else {
+                false
+            }
+        }.getOrDefault(false)
     }
 
     private suspend fun resolveViaCustomWorker(
