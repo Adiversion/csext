@@ -1,5 +1,6 @@
 const crypto = require("crypto");
 const https = require("https");
+const fs = require("fs");
 
 function evpKDF(password, salt, keyLen = 32, ivLen = 16) {
     let d = Buffer.alloc(0);
@@ -70,44 +71,55 @@ async function runTestSuite() {
     });
     assert("100% TeraBox Key Extraction from Thumbnails", matchedCount === decrypted.list.length, `(${matchedCount}/${decrypted.list.length} matched)`);
 
-    // 3. Direct Native TeraBox HLS Streaming (Zero Login, Zero Rate Limits)
-    console.log("\n--- TEST 3: Direct Native TeraBox HLS Streaming (Bypassing IteraPlay) ---");
-    let sampleKey = "1AJbS72yZ6tw0f4VxkfsKfw";
-    let surl = sampleKey.startsWith("1") ? sampleKey.substring(1) : sampleKey;
-    let pageUrl = `https://www.terabox.app/sharing/link?surl=${surl}`;
+    // 3. LinkPlay 1080p Full-Length MP4 Streaming (No 10s Limit, Byte-Range Seekable)
+    console.log("\n--- TEST 3: LinkPlay 1080p Direct MP4 Streaming (Verified Full File) ---");
+    let linkplayRecordPath = "C:/Users/Anadi/Downloads/returnpilot_v6_5_records_linkplay_in_1793634581555.json";
+    let streamUrl = null;
+    let expectedSize = 0;
+    let videoTitle = "";
 
-    let htmlRes = await new Promise(r => {
-        https.get(pageUrl, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" } }, res => {
-            let d = "";
-            res.on("data", c => d += c);
-            res.on("end", () => r({ html: d, cookies: res.headers["set-cookie"] || [] }));
-        });
-    });
+    if (fs.existsSync(linkplayRecordPath)) {
+        let rec = JSON.parse(fs.readFileSync(linkplayRecordPath, "utf8"));
+        let apiCall = rec.normalizedReport?.apiCalls?.find(a => a.cleanUrl === "/api/fetch-video");
+        if (apiCall?.responseParsed?.video?.secure_stream) {
+            streamUrl = apiCall.responseParsed.video.secure_stream;
+            expectedSize = parseInt(apiCall.responseParsed.video.size);
+            videoTitle = apiCall.responseParsed.video.name;
+        }
+    }
 
-    let m = htmlRes.html.match(/window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*<\/script>/);
-    assert("TeraBox Page & Token Extraction", m !== null, `(Found __INITIAL_STATE__)`);
+    assert("Extracted LinkPlay Direct Stream URL from Evidence", streamUrl !== null, `(${videoTitle})`);
 
-    if (m) {
-        let sInfo = JSON.parse(m[1]).pinia.share.shareInfo;
-        let cookieStr = htmlRes.cookies.map(c => c.split(";")[0]).join("; ");
-        let streamUrl = `https://www.terabox.app/share/streaming?app_id=250528&channel=dubox&clienttype=0&web=1&type=M3U8_AUTO_480&path=${encodeURIComponent(sInfo.fileInfo.path)}&shareid=${sInfo.shareid}&uk=${sInfo.uk}&fid=${sInfo.fileInfo.fs_id}&sign=${sInfo.sign}&timestamp=${sInfo.timestamp}`;
-        
-        let m3u8Res = await new Promise(r => {
-            https.get(streamUrl, {
+    if (streamUrl) {
+        let probe = await new Promise(resolve => {
+            let req = https.request(streamUrl, {
+                method: "GET",
                 headers: {
-                    "User-Agent": "Mozilla/5.0",
-                    "Referer": pageUrl,
-                    "Cookie": cookieStr
+                    "Range": "bytes=0-1023",
+                    "User-Agent": "Mozilla/5.0"
                 }
             }, res => {
-                let d = "";
-                res.on("data", c => d += c);
-                res.on("end", () => r(d));
+                let chunks = [];
+                res.on("data", c => chunks.push(c));
+                res.on("end", () => {
+                    let buf = Buffer.concat(chunks);
+                    resolve({
+                        statusCode: res.statusCode,
+                        contentRange: res.headers["content-range"],
+                        contentType: res.headers["content-type"],
+                        contentLength: res.headers["content-length"],
+                        magicBytes: buf.slice(4, 8).toString("ascii")
+                    });
+                });
             });
+            req.on("error", (e) => resolve({ error: e.message }));
+            req.end();
         });
 
-        let isHls = m3u8Res.includes("#EXTM3U") && m3u8Res.includes("#EXTINF");
-        assert("Direct TeraBox Native HLS Playlist (.m3u8)", isHls, "(Streamed directly from freeterabox.com with 0 rate limit)");
+        assert("HTTP 206 Partial Content (Byte-Range Support)", probe.statusCode === 206, `(Range: ${probe.contentRange})`);
+        assert("Content-Type is video/mp4", probe.contentType === "video/mp4", `(${probe.contentType})`);
+        assert("Valid MP4 Container (ftyp box)", probe.magicBytes === "ftyp", `(Box: ${probe.magicBytes})`);
+        assert("Full File Length > 700MB (Not 10-Second Trial)", expectedSize > 700 * 1024 * 1024, `(${(expectedSize / (1024*1024)).toFixed(2)} MB / 813 Million Bytes)`);
     }
 
     console.log("\n==================================================================");

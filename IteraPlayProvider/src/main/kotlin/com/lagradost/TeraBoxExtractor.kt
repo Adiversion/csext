@@ -1,11 +1,33 @@
 package com.lagradost
 
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.Dialog
 import android.content.Context
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.Window
+import android.view.WindowManager
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 open class TeraBoxExtractor : ExtractorApi() {
     override val name = "TeraBox"
@@ -21,6 +43,9 @@ open class TeraBoxExtractor : ExtractorApi() {
         @Volatile var ndusCookie: String? = null
         @Volatile var customWorkerUrl: String? = null
         @Volatile private var cachedSessionCookies: String? = null
+
+        data class CachedStream(val url: String, val name: String, val expiresAt: Long)
+        private val linkPlayCache = ConcurrentHashMap<String, CachedStream>()
 
         fun getSavedNdus(context: Context? = null): String? {
             if (!ndusCookie.isNullOrBlank()) return ndusCookie
@@ -38,7 +63,6 @@ open class TeraBoxExtractor : ExtractorApi() {
             }
 
             // 2. Automatic Auto-Detection from Android CookieManager:
-            // If user ever logged into TeraBox on their Android device, grab ndus automatically with 0 manual typing
             val fromCookieManager = runCatching {
                 val cookieManager = android.webkit.CookieManager.getInstance()
                 val cookies = cookieManager.getCookie("https://www.terabox.app")
@@ -115,6 +139,25 @@ open class TeraBoxExtractor : ExtractorApi() {
                 cookies
             }.getOrDefault("")
         }
+
+        private fun getActivity(): Activity? {
+            return CommonActivity.activity ?: runCatching {
+                val activityThreadClass = Class.forName("android.app.ActivityThread")
+                val currentActivityThreadMethod = activityThreadClass.getMethod("currentActivityThread")
+                val activityThread = currentActivityThreadMethod.invoke(null)
+                val mActivitiesField = activityThreadClass.getDeclaredField("mActivities").apply { isAccessible = true }
+                val activities = mActivitiesField.get(activityThread) as? Map<*, *>
+                activities?.values?.firstNotNullOfOrNull { record ->
+                    if (record == null) return@firstNotNullOfOrNull null
+                    val pausedField = record.javaClass.getDeclaredField("paused").apply { isAccessible = true }
+                    val isPaused = pausedField.getBoolean(record)
+                    if (!isPaused) {
+                        val activityField = record.javaClass.getDeclaredField("activity").apply { isAccessible = true }
+                        activityField.get(record) as? Activity
+                    } else null
+                }
+            }.getOrNull()
+        }
     }
 
     override suspend fun getUrl(
@@ -132,92 +175,318 @@ open class TeraBoxExtractor : ExtractorApi() {
             if (resolvedDirect) return
         }
 
-        // 2. Direct TeraBox Native HLS Streaming (100% Free, NO Rate Limits, NO Login)
-        resolveDirectTeraBoxHls(cleanUrl, callback)
-
-        // 3. Custom Gateway Mode (e.g. saahiyo/terabox-gateway worker):
+        // 2. Custom Gateway Mode (e.g. saahiyo/terabox-gateway worker):
         val customWorker = getSavedCustomWorker()
         if (!customWorker.isNullOrBlank()) {
             val resolvedCustom = resolveViaCustomWorker(cleanUrl, customWorker, callback)
             if (resolvedCustom) return
         }
 
-        // 4. Bonus Transcode Worker for 720p/1080p HD (subject to guest limit)
+        // 3. LinkPlay 1080p/720p Direct MP4 Resolver (Full duration, No 10-second preview limit)
+        val resolvedLinkPlay = resolveViaLinkPlay(cleanUrl, callback)
+        if (resolvedLinkPlay) return
+
+        // 4. Fallback: Transcode Worker for HD (subject to guest limit)
         resolveViaTranscodeWorker(cleanUrl, subtitleCallback, callback)
     }
 
-    private suspend fun resolveDirectTeraBoxHls(
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun resolveViaLinkPlay(
         rawUrl: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return runCatching {
-            val surl = extractSurl(rawUrl) ?: return false
-            val pageUrl = "https://www.terabox.app/sharing/link?surl=$surl"
-            val pageRes = app.get(
-                pageUrl,
-                headers = mapOf("User-Agent" to USER_AGENT),
-                timeout = 10
+        val surl = extractSurl(rawUrl) ?: return false
+        val canonicalKey = if (surl.startsWith("1")) surl else "1$surl"
+        val fullTeraBoxUrl = "https://terabox.app/s/$canonicalKey"
+
+        // Check in-memory cache first (prevents redundant Turnstile solves)
+        val cached = linkPlayCache[canonicalKey]
+        if (cached != null && System.currentTimeMillis() < cached.expiresAt - 60_000L) {
+            callback(
+                newExtractorLink(
+                    source = "LinkPlay Direct",
+                    name = "${cached.name} - [LinkPlay 1080p ⚡]",
+                    url = cached.url,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = "https://linkplay.in/"
+                    this.quality = Qualities.P1080.value
+                }
             )
-            val html = pageRes.text
-            val cookies = pageRes.headers
-                .filter { it.first.equals("set-cookie", ignoreCase = true) }
-                .map { it.second.substringBefore(";").trim() }
-                .filter { it.isNotBlank() }
-                .joinToString("; ")
+            return true
+        }
 
-            val stateJson = Regex("""window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*<\/script>""").find(html)?.groupValues?.get(1)
-                ?: return false
-            val root = parseJson<Map<String, Any?>>(stateJson)
-            val pinia = root["pinia"] as? Map<*, *> ?: return false
-            val share = pinia["share"] as? Map<*, *> ?: return false
-            val sInfo = share["shareInfo"] as? Map<*, *> ?: return false
-            val fileInfo = sInfo["fileInfo"] as? Map<*, *> ?: return false
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return false
+        }
 
-            val sign = sInfo["sign"]?.toString() ?: return false
-            val timestamp = sInfo["timestamp"]?.toString() ?: return false
-            val shareid = sInfo["shareid"]?.toString() ?: return false
-            val uk = sInfo["uk"]?.toString() ?: return false
-            val path = fileInfo["path"]?.toString() ?: return false
-            val fid = fileInfo["fs_id"]?.toString() ?: return false
-            val filename = fileInfo["server_filename"]?.toString() ?: "TeraBox Video"
+        val activity = CommonActivity.activity ?: getActivity() ?: return false
+        if (activity.isFinishing || activity.isDestroyed) return false
 
-            var found = false
-            val qualities = listOf("M3U8_AUTO_480" to Qualities.P480, "M3U8_AUTO_360" to Qualities.P360)
-            for (q in qualities) {
-                val encodedPath = URLEncoder.encode(path, "UTF-8")
-                val streamUrl = "https://www.terabox.app/share/streaming?app_id=250528&channel=dubox&clienttype=0&web=1&type=${q.first}&path=$encodedPath&shareid=$shareid&uk=$uk&fid=$fid&sign=$sign&timestamp=$timestamp"
-                val probe = app.get(
-                    streamUrl,
-                    headers = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Referer" to pageUrl,
-                        "Cookie" to cookies
-                    ),
-                    timeout = 6
-                )
-                if (probe.text.contains("#EXTM3U")) {
-                    found = true
-                    val qNum = q.first.replace("M3U8_AUTO_", "")
-                    callback(
-                        newExtractorLink(
-                            source = "TeraBox Direct",
-                            name = "$filename - [TeraBox Direct ${qNum}p 🟢]",
-                            url = streamUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "https://www.terabox.app/"
-                            this.quality = q.second.value
-                            this.headers = mapOf(
-                                "Cookie" to cookies,
-                                "User-Agent" to USER_AGENT,
-                                "Referer" to pageUrl
-                            )
-                        }
+        val latch = CountDownLatch(1)
+        var resolvedVideo: LinkPlayVideo? = null
+
+        activity.runOnUiThread {
+            try {
+                val density = activity.resources.displayMetrics.density
+                val dialog = Dialog(activity, android.R.style.Theme_DeviceDefault_NoActionBar)
+                dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+                dialog.setOnShowListener {
+                    dialog.window?.apply {
+                        setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                        setBackgroundDrawable(ColorDrawable(Color.parseColor("#121218")))
+                        clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                    }
+                }
+
+                // Start invisible so non-interactive Turnstile completes with zero flicker
+                dialog.window?.decorView?.alpha = 0f
+
+                val handler = Handler(Looper.getMainLooper())
+                var tokenCaptured = false
+
+                val root = LinearLayout(activity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setBackgroundColor(Color.parseColor("#121218"))
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
                     )
                 }
+
+                val header = LinearLayout(activity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setBackgroundColor(Color.parseColor("#1E1E2A"))
+                    setPadding((16 * density).toInt(), (14 * density).toInt(), (16 * density).toInt(), (14 * density).toInt())
+                    gravity = Gravity.CENTER_VERTICAL
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                }
+
+                val titleTv = TextView(activity).apply {
+                    text = "LinkPlay 1080p Verification"
+                    setTextColor(Color.WHITE)
+                    textSize = 16f
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                }
+
+                val closeBtn = Button(activity).apply {
+                    text = "✕"
+                    setTextColor(Color.LTGRAY)
+                    setBackgroundColor(Color.TRANSPARENT)
+                    textSize = 18f
+                    setOnClickListener { dialog.dismiss() }
+                }
+
+                header.addView(titleTv)
+                header.addView(closeBtn)
+                root.addView(header)
+
+                val statusTv = TextView(activity).apply {
+                    text = "Verifying browser integrity for 1080p playback..."
+                    setTextColor(Color.parseColor("#A0A0B0"))
+                    textSize = 12f
+                    setPadding((16 * density).toInt(), (10 * density).toInt(), (16 * density).toInt(), (8 * density).toInt())
+                }
+                root.addView(statusTv)
+
+                val progressBar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                    isIndeterminate = true
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        (4 * density).toInt()
+                    )
+                }
+                root.addView(progressBar)
+
+                val webView = WebView(activity).apply {
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        0,
+                        1f
+                    )
+                }
+
+                val cookieManager = android.webkit.CookieManager.getInstance()
+                cookieManager.setAcceptCookie(true)
+                cookieManager.setAcceptThirdPartyCookies(webView, true)
+
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    allowContentAccess = true
+                    allowFileAccess = true
+                    cacheMode = WebSettings.LOAD_DEFAULT
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+
+                    val baseUa = userAgentString ?: USER_AGENT
+                    val sanitizedUa = baseUa
+                        .replace("; wv", "")
+                        .replace(Regex("Version/[0-9.]+\\s*"), "")
+                        .replace("Android TV", "Android")
+                        .let { ua ->
+                            if (ua.contains("Android") && ua.contains("Safari/") && !ua.contains("Mobile Safari/")) {
+                                ua.replace("Safari/", "Mobile Safari/")
+                            } else ua
+                        }
+                    userAgentString = sanitizedUa
+                }
+
+                // Reveal dialog if user interaction (checkbox click) is needed after 2.2 seconds
+                val revealRunnable = Runnable {
+                    if (!tokenCaptured && dialog.isShowing) {
+                        statusTv.text = "Please complete the verification checkmark below to start video."
+                        runCatching {
+                            dialog.window?.decorView?.animate()?.alpha(1f)?.setDuration(250L)?.start()
+                        }
+                    }
+                }
+
+                var pollElapsedMs = 0L
+                lateinit var pollRunnable: Runnable
+                pollRunnable = Runnable {
+                    if (tokenCaptured) return@Runnable
+                    pollElapsedMs += 500L
+
+                    val checkJs = """
+                        (function() {
+                            try {
+                                if (typeof turnstile !== 'undefined') {
+                                    var t = turnstile.getResponse();
+                                    if (t && t.length > 20) return t;
+                                }
+                                var inp = document.querySelector('[name="cf-turnstile-response"]');
+                                if (inp && inp.value && inp.value.length > 20) return inp.value;
+                            } catch(e) {}
+                            return '';
+                        })();
+                    """.trimIndent()
+
+                    webView.evaluateJavascript(checkJs) { rawVal ->
+                        val token = rawVal?.trim('"', '\'')?.replace("\\", "")
+                        if (!token.isNullOrBlank() && token.length > 20) {
+                            tokenCaptured = true
+                            handler.removeCallbacks(revealRunnable)
+
+                            Thread {
+                                try {
+                                    val postBody = mapOf(
+                                        "url" to fullTeraBoxUrl,
+                                        "turnstileToken" to token
+                                    )
+                                    val res = app.post(
+                                        "https://linkplay.in/api/fetch-video",
+                                        json = postBody,
+                                        headers = mapOf(
+                                            "User-Agent" to webView.settings.userAgentString,
+                                            "Referer" to "https://linkplay.in/",
+                                            "Origin" to "https://linkplay.in",
+                                            "Content-Type" to "application/json"
+                                        ),
+                                        timeout = 25
+                                    ).parsedSafe<LinkPlayResponse>()
+
+                                    if (res?.success == true && res.video != null) {
+                                        resolvedVideo = res.video
+                                    }
+                                } catch (e: Throwable) {
+                                    Log.e("TeraBox", "LinkPlay fetch-video error: ${e.message}")
+                                } finally {
+                                    activity.runOnUiThread {
+                                        runCatching { if (dialog.isShowing) dialog.dismiss() }
+                                    }
+                                    latch.countDown()
+                                }
+                            }.start()
+                            return@evaluateJavascript
+                        }
+
+                        if (pollElapsedMs >= 40_000L) {
+                            Log.w("TeraBox", "LinkPlay Turnstile timed out after 40s")
+                            latch.countDown()
+                            runCatching { if (dialog.isShowing) dialog.dismiss() }
+                            return@evaluateJavascript
+                        }
+
+                        handler.postDelayed(pollRunnable, 500L)
+                    }
+                }
+
+                webView.webChromeClient = object : WebChromeClient() {
+                    override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                        super.onProgressChanged(view, newProgress)
+                        progressBar.progress = newProgress
+                    }
+                }
+
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        progressBar.visibility = View.GONE
+                    }
+                }
+
+                root.addView(webView)
+                dialog.setContentView(root)
+
+                dialog.setOnDismissListener {
+                    handler.removeCallbacks(pollRunnable)
+                    handler.removeCallbacks(revealRunnable)
+                    latch.countDown()
+                }
+
+                dialog.show()
+                webView.loadUrl("https://linkplay.in/")
+                handler.postDelayed(pollRunnable, 700L)
+                handler.postDelayed(revealRunnable, 2200L)
+
+            } catch (e: Throwable) {
+                Log.e("TeraBox", "resolveViaLinkPlay failed: ${e.message}")
+                latch.countDown()
             }
-            found
-        }.getOrDefault(false)
+        }
+
+        try {
+            latch.await(45, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {}
+
+        val video = resolvedVideo
+        val streamUrl = video?.secure_stream ?: video?.secure_download
+        if (!streamUrl.isNullOrBlank()) {
+            val videoName = video.name ?: "TeraBox Video"
+            val expires = Regex("""expires=(\d+)""").find(streamUrl)?.groupValues?.get(1)?.toLongOrNull()
+                ?: (System.currentTimeMillis() + 900_000L)
+            linkPlayCache[canonicalKey] = CachedStream(streamUrl, videoName, expires)
+
+            val q = when {
+                videoName.contains("1080", ignoreCase = true) || videoName.contains("4k", ignoreCase = true) -> Qualities.P1080.value
+                videoName.contains("720", ignoreCase = true) -> Qualities.P720.value
+                videoName.contains("480", ignoreCase = true) -> Qualities.P480.value
+                else -> Qualities.P1080.value
+            }
+
+            callback(
+                newExtractorLink(
+                    source = "LinkPlay Direct",
+                    name = "$videoName - [LinkPlay Direct MP4 ⚡]",
+                    url = streamUrl,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = "https://linkplay.in/"
+                    this.quality = q
+                }
+            )
+            return true
+        }
+
+        return false
     }
 
     private suspend fun resolveViaCustomWorker(
@@ -307,7 +576,6 @@ open class TeraBoxExtractor : ExtractorApi() {
             // Retry once if token expired
             if (streamRes?.status != "success") {
                 if (streamRes?.status == "error") {
-                    val errMsg = streamRes?.list?.firstOrNull()?.name
                     CommonActivity.activity?.let { act ->
                         act.runOnUiThread {
                             android.widget.Toast.makeText(
@@ -385,6 +653,23 @@ class TeraBox1024BoxExtractor : TeraBoxExtractor() {
 class TeraBoxLinkExtractor : TeraBoxExtractor() {
     override val mainUrl = "https://teraboxlink.com"
 }
+
+data class LinkPlayResponse(
+    @JsonProperty("success") val success: Boolean = false,
+    @JsonProperty("cached") val cached: Boolean? = null,
+    @JsonProperty("downloading") val downloading: Boolean? = null,
+    @JsonProperty("video") val video: LinkPlayVideo? = null,
+    @JsonProperty("error") val error: String? = null
+)
+
+data class LinkPlayVideo(
+    @JsonProperty("id") val id: String? = null,
+    @JsonProperty("name") val name: String? = null,
+    @JsonProperty("size") val size: String? = null,
+    @JsonProperty("thumbnail") val thumbnail: String? = null,
+    @JsonProperty("secure_stream") val secure_stream: String? = null,
+    @JsonProperty("secure_download") val secure_download: String? = null
+)
 
 data class TeraBoxShareListResponse(
     @JsonProperty("errno") val errno: Int? = null,
