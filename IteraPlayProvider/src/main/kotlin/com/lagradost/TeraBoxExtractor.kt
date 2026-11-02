@@ -22,13 +22,35 @@ open class TeraBoxExtractor : ExtractorApi() {
 
         fun getSavedNdus(context: Context? = null): String? {
             if (!ndusCookie.isNullOrBlank()) return ndusCookie
-            val ctx = context ?: CommonActivity.activity ?: return null
-            return runCatching {
-                val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                val c = prefs.getString(KEY_NDUS, null)
-                ndusCookie = c
-                c
+            val ctx = context ?: CommonActivity.activity
+
+            // 1. Check SharedPreferences
+            val fromPrefs = runCatching {
+                val prefs = ctx?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs?.getString(KEY_NDUS, null)
             }.getOrNull()
+
+            if (!fromPrefs.isNullOrBlank()) {
+                ndusCookie = fromPrefs
+                return fromPrefs
+            }
+
+            // 2. Automatic Auto-Detection from Android CookieManager:
+            // If user ever logged into TeraBox on their Android device, grab ndus automatically with 0 manual typing
+            val fromCookieManager = runCatching {
+                val cookieManager = android.webkit.CookieManager.getInstance()
+                val cookies = cookieManager.getCookie("https://www.terabox.app")
+                    ?: cookieManager.getCookie("https://www.terabox.com")
+                    ?: ""
+                Regex("""\bndus=([^;]+)""").find(cookies)?.groupValues?.get(1)
+            }.getOrNull()
+
+            if (!fromCookieManager.isNullOrBlank()) {
+                saveNdus(ctx, fromCookieManager)
+                return fromCookieManager
+            }
+
+            return null
         }
 
         fun saveNdus(context: Context? = null, cookie: String?) {

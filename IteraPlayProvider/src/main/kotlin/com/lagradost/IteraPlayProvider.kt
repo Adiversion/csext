@@ -335,7 +335,7 @@ class IteraPlayProvider : MainAPI() {
             }.getOrNull()
         }
 
-        var foundLinks = false
+        foundLinks = false
         streamRes?.list?.forEach { file ->
             val fastStreams = file.fastStreamUrl ?: return@forEach
             fastStreams.forEach { (qualityKey, m3u8Url) ->
