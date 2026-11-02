@@ -456,7 +456,7 @@ open class TeraBoxExtractor : ExtractorApi() {
             val video = res?.video
             val streamUrl = video?.secure_stream ?: video?.secure_download
             if (res?.success == true && !streamUrl.isNullOrBlank()) {
-                val videoName = video.name ?: "TeraBox Video"
+                val videoName = video?.name ?: "TeraBox Video"
                 val expires = Regex("""expires=(\d+)""").find(streamUrl)?.groupValues?.get(1)?.toLongOrNull()
                     ?: (System.currentTimeMillis() + 900_000L)
                 linkPlayCache[canonicalKey] = CachedStream(streamUrl, videoName, expires)
