@@ -316,6 +316,15 @@ class IteraPlayProvider : MainAPI() {
 
         // Self-Healing token refresh if verification token expired
         if (streamRes?.status != "success") {
+            CommonActivity.activity?.let { act ->
+                act.runOnUiThread {
+                    android.widget.Toast.makeText(
+                        act,
+                        "iTeraPlay: Guest limit (5 videos/6h) reached. Switch mobile data or login in settings.",
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
             sessionCookies = null
             cookies = getSessionCookies()
             val retryCookie = listOfNotNull(

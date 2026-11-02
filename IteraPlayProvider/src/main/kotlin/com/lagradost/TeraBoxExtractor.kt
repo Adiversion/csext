@@ -219,6 +219,18 @@ open class TeraBoxExtractor : ExtractorApi() {
 
             // Retry once if token expired
             if (streamRes?.status != "success") {
+                if (streamRes?.status == "error") {
+                    val errMsg = streamRes?.list?.firstOrNull()?.name
+                    CommonActivity.activity?.let { act ->
+                        act.runOnUiThread {
+                            android.widget.Toast.makeText(
+                                act,
+                                "iTeraPlay: Guest limit reached (5 videos/6h). Switch mobile data/IP or login in settings.",
+                                android.widget.Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                }
                 cachedSessionCookies = null
                 cookies = getSessionCookies()
                 if (cookies.isNotBlank()) streamHeaders["Cookie"] = cookies
