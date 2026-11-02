@@ -53,29 +53,27 @@ class IteraPlayProvider : MainAPI() {
     }
 
     override val mainPage = mainPageOf(
-        "latest"   to "Latest Uploads",
-        "trending" to "Trending Viral Videos",
-        "random"   to "Random Discover",
-        "720p"     to "HD 720p Videos",
-        "1080p"    to "Full HD 1080p"
+        "trending" to "Trending",
+        "random"   to "For You",
+        "popular"  to "Popular",
+        "recent"   to "Latest"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sort = request.data
         val offset = (page - 1) * 20
-        val quality = if (sort == "720p" || sort == "1080p") sort else ""
-        val effectiveSort = if (sort == "720p" || sort == "1080p") "trending" else sort
+        val effectiveSort = sort
 
         val cookie = getSavedCookie()
         val (targetUrl, reqHeaders) = if (!cookie.isNullOrBlank()) {
-            "$mainUrl/api/home/search?q=&sort=$effectiveSort&limit=20&offset=$offset&quality=$quality&duration=" to mapOf(
+            "$mainUrl/api/home/search?q=&sort=$effectiveSort&limit=20&offset=$offset&quality=&duration=" to mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer" to "$mainUrl/premium-videos",
                 "Cookie" to "remember_me=$cookie",
                 "Accept" to "application/json, text/plain, */*"
             )
         } else {
-            "$altCatalogUrl/api/home/search?sort=$effectiveSort&offset=$offset&limit=20&quality=$quality&duration=" to mapOf(
+            "$altCatalogUrl/api/home/search?sort=$effectiveSort&offset=$offset&limit=20&quality=&duration=" to mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer" to "$altCatalogUrl/",
                 "Accept" to "application/json, text/plain, */*"

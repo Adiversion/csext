@@ -81,12 +81,28 @@ async function runTestSuite() {
         }
     }
 
-    // 1. Latest Uploads API
-    console.log("\n--- TEST 1: Latest Uploads Catalog & AES Decryption ---");
-    let res = await getJSON("https://teraviralhub.com/api/home/search?sort=latest&offset=0&limit=10");
-    assert("API success flag", res.data?.success === true);
-    let decrypted = JSON.parse(decrypt(res.data.data, "iteraplay_super_secret_enc_key_2026_v2"));
-    assert("AES Decryption & Catalog Parsing", decrypted.list && decrypted.list.length > 0, `(${decrypted.list.length} items found)`);
+    // 1. Home Page 4 Racks Verification (Trending, For You, Popular, Latest)
+    console.log("\n--- TEST 1: Home Page 4 Racks (Trending, For You, Popular, Latest) ---");
+    const racks = [
+        { sort: "trending", name: "Trending" },
+        { sort: "random",   name: "For You" },
+        { sort: "popular",  name: "Popular" },
+        { sort: "recent",   name: "Latest" }
+    ];
+    let allRacksValid = true;
+    let decrypted = null;
+    for (let rack of racks) {
+        let rRes = await getJSON(`https://teraviralhub.com/api/home/search?sort=${rack.sort}&offset=0&limit=10`);
+        if (rRes.data?.success && rRes.data?.data) {
+            let dec = JSON.parse(decrypt(rRes.data.data, "iteraplay_super_secret_enc_key_2026_v2"));
+            assert(`Rack [${rack.name}] (${rack.sort}) Returned Items`, dec.list && dec.list.length > 0, `(${dec.list?.length} items, first: ${dec.list?.[0]?.file_name?.slice(0, 30)})`);
+            if (rack.sort === "recent") decrypted = dec;
+        } else {
+            allRacksValid = false;
+            assert(`Rack [${rack.name}] (${rack.sort}) Returned Items`, false, "(API failed)");
+        }
+    }
+    assert("All 4 Home Page Racks Functional", allRacksValid);
 
     // 2. Thumbnail-to-TeraBox Key Extraction
     console.log("\n--- TEST 2: Thumbnail-to-TeraBox Key Extraction ---");
