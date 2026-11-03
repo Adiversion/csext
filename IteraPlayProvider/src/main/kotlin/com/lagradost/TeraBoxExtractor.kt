@@ -171,21 +171,24 @@ open class TeraBoxExtractor : ExtractorApi() {
         val ndus = getSavedNdus()
         val customWorker = getSavedCustomWorker()
 
-        // 1. Direct Official TeraBox (Fastest 1080p, bypasses all 3rd party sites)
-        // If user is logged in with ndus, resolve directly via TeraBox CDN first!
-        if (!ndus.isNullOrBlank()) {
-            val directFound = resolveDirectTeraBox(cleanUrl, ndus, callback)
-            if (directFound) return
-        }
+        // Run all resolvers in parallel so links appear in 1-2 seconds without waiting
+        coroutineScope {
+            val jobDirect = if (!ndus.isNullOrBlank()) async {
+                runCatching { resolveDirectTeraBox(cleanUrl, ndus, callback) }.getOrDefault(false)
+            } else null
 
-        // 2. Private Gateway Worker (if configured)
-        if (!customWorker.isNullOrBlank()) {
-            val workerFound = resolveViaCustomWorker(cleanUrl, customWorker, callback)
-            if (workerFound) return
-        }
+            val jobWorker = if (!customWorker.isNullOrBlank()) async {
+                runCatching { resolveViaCustomWorker(cleanUrl, customWorker, callback) }.getOrDefault(false)
+            } else null
 
-        // 3. Fallback to free upstream (iTeraPlay.in Multi-Quality 1080p Engine)
-        resolveViaIteraPlayIn(cleanUrl, callback)
+            val jobIn = async {
+                runCatching { resolveViaIteraPlayIn(cleanUrl, callback) }.getOrDefault(false)
+            }
+
+            jobDirect?.await()
+            jobWorker?.await()
+            jobIn.await()
+        }
     }
 
     private suspend fun resolveViaIteraPlayIn(
@@ -207,7 +210,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                 target,
                 headers = headers,
                 json = mapOf("url" to fullTeraBoxUrl),
-                timeout = 35
+                timeout = 6
             ).parsedSafe<IteraPlayInImportResponse>()
 
             val videos = res?.videos
@@ -215,6 +218,30 @@ open class TeraBoxExtractor : ExtractorApi() {
                 var found = false
                 for (video in videos) {
                     val title = video.title?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
+
+                    // 1. Immediately emit pure 1080p Direct MP4 first for instant 1-2s loading!
+                    val streamUrl = video.streamUrl
+                    if (!streamUrl.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "iTeraPlay Direct",
+                                name = "$title - [1080p Direct MP4 ⚡]",
+                                url = streamUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://iteraplay.in/"
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://iteraplay.in/",
+                                    "Origin" to "https://iteraplay.in"
+                                )
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+                        found = true
+                    }
+
+                    // 2. Multi-quality adaptive streams
                     val fastStreams = video.fastStreamUrl
                     if (fastStreams != null && fastStreams.isNotEmpty()) {
                         val orderedKeys = listOf("1080p", "720p", "480p", "360p")
@@ -233,13 +260,12 @@ open class TeraBoxExtractor : ExtractorApi() {
                                 else    -> Qualities.Unknown.value
                             }
 
-                            // v.cdniteraplay.qzz.io/hls?token= returns the raw video segment URL, not an #EXTM3U playlist
                             val finalStreamUrl = if (rawHlsUrl.contains("/hls?token=")) {
                                 runCatching {
                                     val body = app.get(
                                         rawHlsUrl,
                                         headers = mapOf("Referer" to "https://iteraplay.in/"),
-                                        timeout = 10
+                                        timeout = 3
                                     ).text.trim()
                                     if (body.startsWith("http")) body else rawHlsUrl
                                 }.getOrDefault(rawHlsUrl)
@@ -266,27 +292,6 @@ open class TeraBoxExtractor : ExtractorApi() {
                             )
                             found = true
                         }
-                    }
-
-                    val streamUrl = video.streamUrl
-                    if (!streamUrl.isNullOrBlank()) {
-                        callback(
-                            newExtractorLink(
-                                source = "iTeraPlay Direct",
-                                name = "$title - [1080p Direct MP4 ⚡]",
-                                url = streamUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = "https://iteraplay.in/"
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer" to "https://iteraplay.in/",
-                                    "Origin" to "https://iteraplay.in"
-                                )
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-                        found = true
                     }
                 }
                 found
@@ -327,7 +332,7 @@ open class TeraBoxExtractor : ExtractorApi() {
     ): Boolean {
         return runCatching {
             val surl = extractSurl(rawUrl) ?: return false
-            val candidateHosts = listOf("dm.terabox.com", "1024tera.com", "www.1024terabox.com", "www.terabox.app", "www.terabox.com")
+            val candidateHosts = listOf("dm.terabox.com", "1024tera.com")
             
             var jsToken: String? = null
             var usedHost = "dm.terabox.com"
@@ -340,7 +345,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     "Referer" to "https://$host/sharing/link?surl=$surl"
                 )
                 val html = runCatching {
-                    app.get(wapUrl, headers = headers, timeout = 10).text
+                    app.get(wapUrl, headers = headers, timeout = 4).text
                 }.getOrNull() ?: continue
 
                 // 1. Extract dynamic jsToken from WAP eval decodeURIComponent
@@ -375,7 +380,7 @@ open class TeraBoxExtractor : ExtractorApi() {
             )
 
             val rootRes = runCatching {
-                app.get(rootUrl, headers = headers, timeout = 10).parsedSafe<TeraBoxShareListResponse>()
+                app.get(rootUrl, headers = headers, timeout = 5).parsedSafe<TeraBoxShareListResponse>()
             }.getOrNull()
 
             val initialList = rootRes?.list
@@ -395,7 +400,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     val dirParam = URLEncoder.encode(item.path, "UTF-8")
                     val subUrl = "https://$usedHost/share/list?app_id=250528${tokenParam}&shorturl=$surl&root=0&dir=$dirParam"
                     val subRes = runCatching {
-                        app.get(subUrl, headers = headers, timeout = 10).parsedSafe<TeraBoxShareListResponse>()
+                        app.get(subUrl, headers = headers, timeout = 4).parsedSafe<TeraBoxShareListResponse>()
                     }.getOrNull()
                     val subList = subRes?.list
                     if (!subList.isNullOrEmpty()) {
