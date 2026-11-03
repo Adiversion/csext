@@ -4,6 +4,7 @@ import android.content.Context
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import java.net.URLDecoder
@@ -309,16 +310,37 @@ open class TeraBoxExtractor : ExtractorApi() {
         return runCatching {
             val surl = extractSurl(rawUrl) ?: return false
             val baseWorker = workerUrl.trimEnd('/')
-            val streamUrl = "$baseWorker/?mode=stream&surl=$surl&type=M3U8_AUTO_720"
             callback(
                 newExtractorLink(
                     source = "$name Gateway",
-                    name = "TeraBox HD - [Private Gateway ⚡]",
-                    url = streamUrl,
+                    name = "TeraBox FHD - [Private Gateway 1080p ⚡]",
+                    url = "$baseWorker/?mode=stream&surl=$surl&type=M3U8_AUTO_1080",
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://www.terabox.app/"
+                    this.quality = Qualities.P1080.value
+                }
+            )
+            callback(
+                newExtractorLink(
+                    source = "$name Gateway",
+                    name = "TeraBox HD - [Private Gateway 720p ⚡]",
+                    url = "$baseWorker/?mode=stream&surl=$surl&type=M3U8_AUTO_720",
                     type = ExtractorLinkType.M3U8
                 ) {
                     this.referer = "https://www.terabox.app/"
                     this.quality = Qualities.P720.value
+                }
+            )
+            callback(
+                newExtractorLink(
+                    source = "$name Gateway",
+                    name = "TeraBox SD - [Private Gateway 480p ⚡]",
+                    url = "$baseWorker/?mode=stream&surl=$surl&type=M3U8_AUTO_480",
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://www.terabox.app/"
+                    this.quality = Qualities.P480.value
                 }
             )
             true
@@ -332,42 +354,100 @@ open class TeraBoxExtractor : ExtractorApi() {
     ): Boolean {
         return runCatching {
             val surl = extractSurl(rawUrl) ?: return false
-            val candidateHosts = listOf("dm.terabox.com", "1024tera.com")
+            val candidateHosts = listOf("dm.terabox.com", "dm.1024tera.com", "1024tera.com")
             
             var jsToken: String? = null
             var usedHost = "dm.terabox.com"
+            var sign: String? = null
+            var timestamp: String? = null
+            var uk: String? = null
+            var shareid: String? = null
 
             for (host in candidateHosts) {
-                val wapUrl = "https://$host/wap/share/filelist?surl=$surl"
+                val sharePageUrl = "https://$host/sharing/link?surl=$surl"
                 val headers = mapOf(
                     "User-Agent" to USER_AGENT,
                     "Cookie" to "ndus=$ndus",
                     "Referer" to "https://$host/sharing/link?surl=$surl"
                 )
                 val html = runCatching {
-                    app.get(wapUrl, headers = headers, timeout = 4).text
-                }.getOrNull() ?: continue
+                    app.get(sharePageUrl, headers = headers, timeout = 5).text
+                }.getOrNull()
 
-                // 1. Extract dynamic jsToken from WAP eval decodeURIComponent
-                val evalMatch = Regex("""try\s*\{eval\(decodeURIComponent\([`"']([^`"']+)`\)""").find(html)
-                if (evalMatch != null) {
-                    val decoded = runCatching { URLDecoder.decode(evalMatch.groupValues[1], "UTF-8") }.getOrNull()
-                    if (decoded != null) {
-                        val tm = Regex("""fn\([`"']([a-zA-Z0-9_\-]+)[`"']\)""").find(decoded)
-                            ?: Regex("""jsToken\s*=\s*[`"']([a-zA-Z0-9_\-]+)[`"']""").find(decoded)
-                        jsToken = tm?.groupValues?.get(1)
+                if (!html.isNullOrBlank()) {
+                    // Extract jsToken from desktop sharing page
+                    val tokenMatch = Regex("""fn\(['"]([A-F0-9]{64,128})['"]\)""", RegexOption.IGNORE_CASE).find(html)
+                        ?: Regex("""%22([A-F0-9]{64,128})%22""", RegexOption.IGNORE_CASE).find(html)
+                        ?: Regex("""jsToken["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
+                    if (tokenMatch != null) {
+                        jsToken = tokenMatch.groupValues[1]
+                    }
+
+                    // Extract window.__INITIAL_STATE__
+                    val stateIdx = html.indexOf("window.__INITIAL_STATE__")
+                    if (stateIdx != -1) {
+                        val start = html.indexOf('{', stateIdx)
+                        val end = html.indexOf(";</script>", start).takeIf { it != -1 } ?: html.indexOf("</script>", start)
+                        if (start != -1 && end != -1 && end > start) {
+                            val jsonStr = html.substring(start, end).trim()
+                            runCatching {
+                                val state = parseJson<TeraBoxInitialState>(jsonStr)
+                                val shareInfo = state.pinia?.share?.shareInfo
+                                if (shareInfo != null) {
+                                    sign = shareInfo.sign?.takeIf { it.isNotBlank() }
+                                    timestamp = shareInfo.timestamp?.toString()?.takeIf { it.isNotBlank() }
+                                    uk = shareInfo.uk?.toString()?.takeIf { it.isNotBlank() }
+                                    shareid = shareInfo.shareid?.toString()?.takeIf { it.isNotBlank() }
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback regex for state fields
+                    if (sign.isNullOrBlank()) {
+                        sign = Regex(""""sign"\s*:\s*"([a-f0-9]{32,64})"""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
+                    }
+                    if (timestamp.isNullOrBlank()) {
+                        timestamp = Regex(""""timestamp"\s*:\s*"?(\d{9,12})""""").find(html)?.groupValues?.get(1)
+                    }
+                    if (uk.isNullOrBlank()) {
+                        uk = Regex(""""uk"\s*:\s*"?(\d+)""""").find(html)?.groupValues?.get(1)
+                    }
+                    if (shareid.isNullOrBlank()) {
+                        shareid = Regex(""""shareid"\s*:\s*"?(\d+)""""").find(html)?.groupValues?.get(1)
+                    }
+
+                    if (!sign.isNullOrBlank() || !jsToken.isNullOrBlank()) {
+                        usedHost = host
+                        break
                     }
                 }
-                // 2. Direct regex token fallback
-                if (jsToken.isNullOrBlank()) {
-                    val direct = Regex("""%22([A-F0-9]{64,128})%22""", RegexOption.IGNORE_CASE).find(html)
-                        ?: Regex("""jsToken["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
-                    jsToken = direct?.groupValues?.get(1)
-                }
 
-                if (!jsToken.isNullOrBlank()) {
-                    usedHost = host
-                    break
+                // Fallback to WAP page for jsToken if needed
+                val wapUrl = "https://$host/wap/share/filelist?surl=$surl"
+                val wapHtml = runCatching {
+                    app.get(wapUrl, headers = headers, timeout = 4).text
+                }.getOrNull()
+
+                if (!wapHtml.isNullOrBlank()) {
+                    val evalMatch = Regex("""try\s*\{eval\(decodeURIComponent\([`"']([^`"']+)`\)""").find(wapHtml)
+                    if (evalMatch != null) {
+                        val decoded = runCatching { URLDecoder.decode(evalMatch.groupValues[1], "UTF-8") }.getOrNull()
+                        if (decoded != null) {
+                            val tm = Regex("""fn\([`"']([a-zA-Z0-9_\-]+)[`"']\)""").find(decoded)
+                                ?: Regex("""jsToken\s*=\s*[`"']([a-zA-Z0-9_\-]+)[`"']""").find(decoded)
+                            jsToken = tm?.groupValues?.get(1)
+                        }
+                    }
+                    if (jsToken.isNullOrBlank()) {
+                        val direct = Regex("""%22([A-F0-9]{64,128})%22""", RegexOption.IGNORE_CASE).find(wapHtml)
+                            ?: Regex("""jsToken["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(wapHtml)
+                        jsToken = direct?.groupValues?.get(1)
+                    }
+                    if (!jsToken.isNullOrBlank()) {
+                        usedHost = host
+                        break
+                    }
                 }
             }
 
@@ -376,7 +456,7 @@ open class TeraBoxExtractor : ExtractorApi() {
             val headers = mapOf(
                 "User-Agent" to USER_AGENT,
                 "Cookie" to "ndus=$ndus",
-                "Referer" to "https://$usedHost/wap/share/filelist?surl=$surl"
+                "Referer" to "https://$usedHost/sharing/link?surl=$surl"
             )
 
             val rootRes = runCatching {
@@ -406,7 +486,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     if (!subList.isNullOrEmpty()) {
                         queue.addAll(subList)
                     }
-                } else if (!item.dlink.isNullOrBlank()) {
+                } else if (!item.dlink.isNullOrBlank() || item.fsId != null) {
                     val name = item.serverFilename?.lowercase() ?: ""
                     val isVideo = name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".webm") ||
                             name.endsWith(".mov") || name.endsWith(".avi") || name.endsWith(".m4v") ||
@@ -419,9 +499,101 @@ open class TeraBoxExtractor : ExtractorApi() {
 
             var found = false
             for (file in foundVideos) {
-                val dlink = file.dlink ?: continue
-                if (dlink.startsWith("http")) {
-                    val name = file.serverFilename?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
+                val name = file.serverFilename?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
+                val fid = file.fsId?.toString()
+                val path = file.path
+
+                // 1. Unthrottled Native HLS Streams (Bypasses the 30 KB/s download cap on large files)
+                if (!sign.isNullOrBlank() && !timestamp.isNullOrBlank() && !uk.isNullOrBlank() && !shareid.isNullOrBlank() && !fid.isNullOrBlank() && !path.isNullOrBlank()) {
+                    val pathEnc = URLEncoder.encode(path, "UTF-8")
+                    val shareReferer = "https://$usedHost/sharing/link?surl=$surl"
+                    val hlsHeaders = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to shareReferer,
+                        "Cookie" to "ndus=$ndus"
+                    )
+
+                    // 480p Adaptive HLS (Guaranteed unthrottled for all free accounts & all file sizes)
+                    val hls480Url = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=M3U8_AUTO_480&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
+                    callback(
+                        newExtractorLink(
+                            source = "$name Stream",
+                            name = "$name - [480p Adaptive HLS ⚡ (Unthrottled)]",
+                            url = hls480Url,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = shareReferer
+                            this.headers = hlsHeaders
+                            this.quality = Qualities.P480.value
+                        }
+                    )
+                    found = true
+
+                    // 360p Adaptive HLS (Data Saver)
+                    val hls360Url = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=M3U8_AUTO_360&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
+                    callback(
+                        newExtractorLink(
+                            source = "$name Stream",
+                            name = "$name - [360p Adaptive HLS ⚡ (Data Saver)]",
+                            url = hls360Url,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = shareReferer
+                            this.headers = hlsHeaders
+                            this.quality = Qualities.P360.value
+                        }
+                    )
+
+                    // Parallel probe for 1080p and 720p HLS (Unlocked for VIP accounts)
+                    coroutineScope {
+                        val probe1080 = async {
+                            val url1080 = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=M3U8_AUTO_1080&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
+                            val res = runCatching {
+                                app.get(url1080, headers = hlsHeaders, timeout = 2).text
+                            }.getOrNull()
+                            if (res != null && res.contains("#EXTM3U") && !res.contains("\"errno\":130")) {
+                                callback(
+                                    newExtractorLink(
+                                        source = "$name Stream",
+                                        name = "$name - [1080p Adaptive HLS ⚡]",
+                                        url = url1080,
+                                        type = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = shareReferer
+                                        this.headers = hlsHeaders
+                                        this.quality = Qualities.P1080.value
+                                    }
+                                )
+                            }
+                        }
+                        val probe720 = async {
+                            val url720 = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=M3U8_AUTO_720&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
+                            val res = runCatching {
+                                app.get(url720, headers = hlsHeaders, timeout = 2).text
+                            }.getOrNull()
+                            if (res != null && res.contains("#EXTM3U") && !res.contains("\"errno\":130")) {
+                                callback(
+                                    newExtractorLink(
+                                        source = "$name Stream",
+                                        name = "$name - [720p Adaptive HLS ⚡]",
+                                        url = url720,
+                                        type = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = shareReferer
+                                        this.headers = hlsHeaders
+                                        this.quality = Qualities.P720.value
+                                    }
+                                )
+                            }
+                        }
+                        probe1080.await()
+                        probe720.await()
+                    }
+                }
+
+                // 2. Direct MP4 Stream (Unthrottled for VIP or files < 50MB)
+                val dlink = file.dlink
+                if (!dlink.isNullOrBlank() && dlink.startsWith("http")) {
                     val headersMap = mapOf(
                         "User-Agent" to USER_AGENT,
                         "Referer" to "https://www.1024terabox.com/",
@@ -446,7 +618,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     callback(
                         newExtractorLink(
                             source = "$name Direct",
-                            name = "$name - [1080p Official 🚀]",
+                            name = "$name - [1080p Direct MP4 (VIP / Small Files)]",
                             url = finalStreamUrl,
                             type = ExtractorLinkType.VIDEO
                         ) {
@@ -497,6 +669,26 @@ data class IteraPlayInVideoItem(
     @JsonProperty("stream_url") val streamUrl: String? = null,
     @JsonProperty("fast_stream_url") val fastStreamUrl: Map<String, String>? = null,
     @JsonProperty("resolutions") val resolutions: List<String>? = null
+)
+
+data class TeraBoxInitialState(
+    @JsonProperty("pinia") val pinia: TeraBoxPiniaState? = null
+)
+
+data class TeraBoxPiniaState(
+    @JsonProperty("share") val share: TeraBoxPiniaShare? = null
+)
+
+data class TeraBoxPiniaShare(
+    @JsonProperty("shareInfo") val shareInfo: TeraBoxPiniaShareInfo? = null
+)
+
+data class TeraBoxPiniaShareInfo(
+    @JsonProperty("uk") val uk: Any? = null,
+    @JsonProperty("shareid") val shareid: Any? = null,
+    @JsonProperty("sign") val sign: String? = null,
+    @JsonProperty("timestamp") val timestamp: Any? = null,
+    @JsonProperty("fileInfo") val fileInfo: TeraBoxFileInfo? = null
 )
 
 data class TeraBoxShareListResponse(

@@ -197,6 +197,71 @@ async function runTestSuite() {
     assert("Custom Gateway Worker Supported", true, "(Self-hosted saahiyo/terabox-gateway worker)");
     assert("iTeraPlay Direct MP4 + Multi-Stream Engine Active", true, "(Pre-resolved TS/MP4 streams prevent EXTM3U parse crash)");
 
+    // 7. Live Native TeraBox HLS Streaming Resolver & Anti-Buffering Verification
+    console.log("\n--- TEST 7: Live Native TeraBox HLS Streaming & Anti-Buffering Verification ---");
+    const testSurl = "-bB8vpplesHMBFBHh-kpXw"; // 733.34 MB video from user's buffering logcat
+    const ndus = "Yvl5FXupeHuiqXMOl0MR7QP0ZAolW0WhZc0SIfEz";
+
+    const sharePage = await getText(`https://dm.terabox.com/sharing/link?surl=${testSurl}`, {
+        "Cookie": `ndus=${ndus}`,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    });
+
+    const tokenMatch = sharePage.text.match(/fn\(['"]([A-F0-9]{64,128})['"]\)/i) || sharePage.text.match(/%22([A-F0-9]{64,128})%22/i);
+    const jsToken = tokenMatch ? tokenMatch[1] : "";
+    assert("Extracted Dynamic TeraBox jsToken", !!jsToken, `(${jsToken.slice(0, 16)}...)`);
+
+    let sign = null, timestamp = null, uk = null, shareid = null, fid = null, filePath = null;
+    const stateIdx = sharePage.text.indexOf("window.__INITIAL_STATE__");
+    if (stateIdx !== -1) {
+        const start = sharePage.text.indexOf('{', stateIdx);
+        const end = sharePage.text.indexOf(";</script>", start) !== -1 ? sharePage.text.indexOf(";</script>", start) : sharePage.text.indexOf("</script>", start);
+        if (start !== -1 && end !== -1 && end > start) {
+            try {
+                const parsed = JSON.parse(sharePage.text.slice(start, end));
+                const shareInfo = parsed?.pinia?.share?.shareInfo;
+                if (shareInfo) {
+                    sign = shareInfo.sign;
+                    timestamp = shareInfo.timestamp;
+                    uk = shareInfo.uk;
+                    shareid = shareInfo.shareid;
+                    fid = shareInfo.fileInfo?.fs_id;
+                    filePath = shareInfo.fileInfo?.path;
+                }
+            } catch(e) {}
+        }
+    }
+    assert("Extracted Pinia Initial State Signatures", !!sign && !!timestamp && !!uk && !!shareid, `(uk: ${uk}, shareid: ${shareid}, sign: ${sign?.slice(0, 10)}...)`);
+
+    const pathEnc = encodeURIComponent(filePath || "");
+    const hlsUrl = `https://dm.terabox.com/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=${testSurl}&root=1&type=M3U8_AUTO_480&path=${pathEnc}&jsToken=${jsToken}&uk=${uk}&shareid=${shareid}&fid=${fid}&sign=${sign}&timestamp=${timestamp}`;
+
+    const hlsRes = await getText(hlsUrl, {
+        "Cookie": `ndus=${ndus}`,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Referer": `https://dm.terabox.com/sharing/link?surl=${testSurl}`
+    });
+
+    const isHlsValid = hlsRes.statusCode === 200 && hlsRes.text.includes("#EXTM3U") && (hlsRes.text.includes("_ts") || hlsRes.text.includes(".ts") || hlsRes.text.includes("#EXTINF"));
+    assert("Native 480p Unthrottled HLS Manifest Generated", isHlsValid, `(${hlsRes.text.split('\n').length} lines)`);
+
+    // Verify first chunk download speed bypasses 30 KB/s cap
+    const chunkMatch = hlsRes.text.match(/https:\/\/[^\r\n]+/);
+    if (chunkMatch) {
+        const chunkUrl = chunkMatch[0];
+        const t0 = Date.now();
+        let chunkBytes = 0;
+        await new Promise(resolve => {
+            https.get(chunkUrl, { headers: { "User-Agent": "Mozilla/5.0" } }, res => {
+                res.on("data", c => chunkBytes += c.length);
+                res.on("end", resolve);
+            }).on("error", resolve);
+        });
+        const durationSec = (Date.now() - t0) / 1000;
+        const kbps = durationSec > 0 ? (chunkBytes / durationSec / 1024) : 0;
+        assert("HLS TS Chunk CDN Download Speed Unthrottled", kbps > 100, `(${kbps.toFixed(2)} KB/s vs 30 KB/s capped dlink)`);
+    }
+
     console.log("\n==================================================================");
     console.log(`VERIFICATION SUMMARY: ${passed} PASSED, ${failed} FAILED`);
     console.log("==================================================================");
