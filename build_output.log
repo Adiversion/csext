@@ -38,9 +38,9 @@ Fetching JAR: cloudstream.jar
 > Task :WaveFlixProvider:parseDebugLocalResources
 > Task :AnimePaheProvider:parseDebugLocalResources
 > Task :IteraPlayProvider:packageDebugResources
-> Task :IteraPlayProvider:parseDebugLocalResources
-> Task :AnimePaheProvider:generateDebugRFile
 > Task :WaveFlixProvider:generateDebugRFile
+> Task :AnimePaheProvider:generateDebugRFile
+> Task :IteraPlayProvider:parseDebugLocalResources
 > Task :IteraPlayProvider:generateDebugRFile
 
 > Task :IteraPlayProvider:compileDebugKotlin
@@ -461,7 +461,7 @@ Try ./gradlew --stop if this issue persists
 If it does not look related to your configuration, please file an issue with logs to https://kotl.in/issue
 
 > Task :IteraPlayProvider:compileDebugKotlin
-exception: iteraPlayProvider/src/main/kotlin/com/lagradost/IteraPlayPlugin.kt:396:13: warning: 'var databaseEnabled: Boolean' is deprecated. Deprecated in Java.
+exception: iteraPlayProvider/src/main/kotlin/com/lagradost/IteraPlayPlugin.kt:401:13: warning: 'var databaseEnabled: Boolean' is deprecated. Deprecated in Java.
 exception:             databaseEnabled = true
 exception:             ^^^^^^^^^^^^^^^
 
@@ -7357,5 +7357,5 @@ Made CloudStream package at /home/runner/work/csext/csext/src/WaveFlixProvider/b
 > Task :makePluginsJson
 Created /home/runner/work/csext/csext/src/build/plugins.json
 
-BUILD SUCCESSFUL in 2m 28s
+BUILD SUCCESSFUL in 2m 32s
 31 actionable tasks: 31 executed
