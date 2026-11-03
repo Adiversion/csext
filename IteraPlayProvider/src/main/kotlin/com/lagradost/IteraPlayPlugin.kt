@@ -129,14 +129,36 @@ class IteraPlayPlugin : Plugin() {
         container.addView(dividerText)
 
         // Section 2: Manual ndus Cookie Input
+        val ndusHeaderLayout = LinearLayout(act).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 8, 0, 4)
+        }
         val ndusLabel = TextView(act).apply {
             text = "Manual ndus Cookie Token:"
             textSize = 13f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
-            setPadding(0, 8, 0, 4)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        container.addView(ndusLabel)
+        ndusHeaderLayout.addView(ndusLabel)
+
+        val syncBtn = Button(act).apply {
+            text = "🔄 Sync Session"
+            textSize = 11.5f
+            setOnClickListener {
+                val found = TeraBoxExtractor.scanCookieManagerForNdus()
+                if (!found.isNullOrBlank()) {
+                    TeraBoxExtractor.saveNdus(act, found)
+                    updateStatusDisplay()
+                    Toast.makeText(act, "✅ Synced ndus: ${found.take(8)}...", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(act, "⚠️ No browser session found yet. Try Web Login.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        ndusHeaderLayout.addView(syncBtn)
+        container.addView(ndusHeaderLayout)
 
         val ndusInput = EditText(act).apply {
             hint = "Paste ndus token from browser (valid ~1 yr)"
@@ -203,19 +225,28 @@ class IteraPlayPlugin : Plugin() {
         // Top Action Bar
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(32, 24, 32, 24)
+            setPadding(24, 20, 24, 20)
             setBackgroundColor(Color.parseColor("#1565C0"))
             gravity = Gravity.CENTER_VERTICAL
         }
 
         val titleView = TextView(activity).apply {
-            text = "Log into TeraBox (Auto-captures session)"
+            text = "TeraBox Login (Auto-Captures Session)"
             setTextColor(Color.WHITE)
-            textSize = 16f
+            textSize = 15f
             setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         topBar.addView(titleView)
+
+        val captureBtn = Button(activity).apply {
+            text = "✔ Done"
+            setTextColor(Color.parseColor("#4CAF50"))
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        topBar.addView(captureBtn)
 
         val closeBtn = Button(activity).apply {
             text = "✕"
@@ -243,27 +274,87 @@ class IteraPlayPlugin : Plugin() {
         val handler = Handler(Looper.getMainLooper())
         var captured = false
 
-        fun checkCookies() {
+        fun onSuccessCaptured(token: String) {
             if (captured) return
-            val cookieManager = CookieManager.getInstance()
-            val cookies = cookieManager.getCookie("https://www.terabox.app")
-                ?: cookieManager.getCookie("https://www.terabox.com")
-                ?: ""
+            captured = true
+            TeraBoxExtractor.saveNdus(activity, token)
+            Toast.makeText(activity, "🎉 TeraBox Connected! [ndus: ${token.take(8)}...]", Toast.LENGTH_LONG).show()
+            onCookieCaptured()
+            dialog.dismiss()
+        }
 
-            val ndus = Regex("""\bndus=([^;]+)""").find(cookies)?.groupValues?.get(1)
-            if (!ndus.isNullOrBlank()) {
-                captured = true
-                TeraBoxExtractor.saveNdus(activity, ndus)
-                Toast.makeText(activity, "🎉 TeraBox Connected! Direct 1080p active.", Toast.LENGTH_LONG).show()
-                onCookieCaptured()
-                dialog.dismiss()
+        fun checkCookies(manualClick: Boolean = false) {
+            if (captured) return
+
+            // 1. Scan CookieManager across all 12 candidate domains & active webView.url
+            val tokenFromCm = TeraBoxExtractor.scanCookieManagerForNdus(webView.url)
+            if (!tokenFromCm.isNullOrBlank()) {
+                onSuccessCaptured(tokenFromCm)
+                return
             }
+
+            // 2. Scan JavaScript document.cookie, localStorage, and sessionStorage
+            val extractScript = """
+                (function() {
+                    try {
+                        var c = document.cookie || '';
+                        var m = c.match(/\bndus=([^;\s"']+)/i);
+                        if (m && m[1]) return m[1].trim();
+
+                        for (var i = 0; i < localStorage.length; i++) {
+                            var k = localStorage.key(i) || '';
+                            var v = localStorage.getItem(k) || '';
+                            if (k.toLowerCase().indexOf('ndus') !== -1 && v.length >= 8) {
+                                var subK = v.match(/\bndus=([^;\s"']+)/i) || v.match(/"ndus"\s*:\s*"([^"]+)"/i);
+                                if (subK && subK[1]) return subK[1].trim();
+                                return v.trim();
+                            }
+                            if (v && v.indexOf('ndus') !== -1) {
+                                var sub = v.match(/"ndus"\s*:\s*"([^"]+)"/i) || v.match(/\bndus=([^;\s"']+)/i);
+                                if (sub && sub[1]) return sub[1].trim();
+                            }
+                        }
+
+                        for (var j = 0; j < sessionStorage.length; j++) {
+                            var sk = sessionStorage.key(j) || '';
+                            var sv = sessionStorage.getItem(sk) || '';
+                            if (sk.toLowerCase().indexOf('ndus') !== -1 && sv.length >= 8) {
+                                return sv.trim();
+                            }
+                            if (sv && sv.indexOf('ndus') !== -1) {
+                                var ssub = sv.match(/"ndus"\s*:\s*"([^"]+)"/i) || sv.match(/\bndus=([^;\s"']+)/i);
+                                if (ssub && ssub[1]) return ssub[1].trim();
+                            }
+                        }
+                    } catch(e) {}
+                    return '';
+                })()
+            """.trimIndent()
+
+            webView.evaluateJavascript(extractScript) { result ->
+                val token = result?.trim('"', ' ', '\n', '\r')
+                if (!token.isNullOrBlank() && token != "null" && token != "undefined" && token.length >= 8) {
+                    onSuccessCaptured(token)
+                } else if (manualClick) {
+                    val currentUrl = webView.url ?: ""
+                    if (currentUrl.contains("/main") || currentUrl.contains("/sharing") || currentUrl.contains("category=all")) {
+                        Toast.makeText(activity, "Logged in! Retrying session capture...", Toast.LENGTH_SHORT).show()
+                        handler.postDelayed({ checkCookies(manualClick = false) }, 1500)
+                    } else {
+                        Toast.makeText(activity, "⚠️ No active session found. Please enter credentials and log in.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+
+        captureBtn.setOnClickListener {
+            checkCookies(manualClick = true)
         }
 
         val pollRunnable = object : Runnable {
             override fun run() {
                 if (!captured && dialog.isShowing) {
-                    checkCookies()
+                    checkCookies(manualClick = false)
                     handler.postDelayed(this, 1200)
                 }
             }
@@ -273,6 +364,8 @@ class IteraPlayPlugin : Plugin() {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
+            useWideViewPort = true
+            loadWithOverviewMode = true
             userAgentString = TeraBoxExtractor.USER_AGENT
         }
 
@@ -283,12 +376,20 @@ class IteraPlayPlugin : Plugin() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
-                checkCookies()
+                webView.evaluateJavascript(
+                    "window.open = function(u) { if (u) window.location.href = u; return window; };",
+                    null
+                )
+                checkCookies(manualClick = false)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
-                checkCookies()
+                webView.evaluateJavascript(
+                    "window.open = function(u) { if (u) window.location.href = u; return window; };",
+                    null
+                )
+                checkCookies(manualClick = false)
             }
         }
 
@@ -298,7 +399,7 @@ class IteraPlayPlugin : Plugin() {
             webView.destroy()
         }
 
-        webView.loadUrl("https://www.terabox.app/main?category=all")
+        webView.loadUrl("https://www.1024terabox.com/login")
         handler.postDelayed(pollRunnable, 1500)
 
         rootLayout.addView(webView)

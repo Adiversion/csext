@@ -14,13 +14,59 @@ open class TeraBoxExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
         private const val PREFS_NAME = "terabox_prefs"
         private const val KEY_NDUS = "terabox_ndus_cookie"
         private const val KEY_CUSTOM_WORKER = "custom_worker_url"
 
         @Volatile var ndusCookie: String? = null
         @Volatile var customWorkerUrl: String? = null
+
+        val CANDIDATE_DOMAINS = listOf(
+            "https://www.1024terabox.com",
+            "https://1024terabox.com",
+            "https://www.terabox.app",
+            "https://terabox.app",
+            "https://www.terabox.com",
+            "https://terabox.com",
+            "https://www.1024tera.com",
+            "https://1024tera.com",
+            "https://www.freeterabox.com",
+            "https://freeterabox.com",
+            "https://www.teraboxlink.com",
+            "https://teraboxlink.com"
+        )
+
+        fun extractNdus(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+            val match = Regex("""(?i)\bndus=([^;\s"']+)""").find(raw)
+            val token = match?.groupValues?.get(1)?.trim() ?: if (!raw.contains("=") && raw.trim().length >= 8) raw.trim() else null
+            return if (!token.isNullOrBlank() && token.length >= 8) token else null
+        }
+
+        fun scanCookieManagerForNdus(extraUrl: String? = null): String? {
+            return runCatching {
+                val cm = android.webkit.CookieManager.getInstance()
+                val targets = mutableListOf<String>()
+                if (!extraUrl.isNullOrBlank()) {
+                    targets.add(extraUrl)
+                }
+                for (domain in CANDIDATE_DOMAINS) {
+                    targets.add(domain)
+                    targets.add("$domain/")
+                    targets.add("$domain/main")
+                    targets.add("$domain/login")
+                }
+                for (t in targets) {
+                    val c = cm.getCookie(t)
+                    val token = extractNdus(c)
+                    if (!token.isNullOrBlank()) {
+                        return@runCatching token
+                    }
+                }
+                null
+            }.getOrNull()
+        }
 
         fun getSavedNdus(context: Context? = null): String? {
             if (!ndusCookie.isNullOrBlank()) return ndusCookie
@@ -37,15 +83,8 @@ open class TeraBoxExtractor : ExtractorApi() {
                 return fromPrefs
             }
 
-            // 2. Automatic Auto-Detection from Android CookieManager:
-            val fromCookieManager = runCatching {
-                val cookieManager = android.webkit.CookieManager.getInstance()
-                val cookies = cookieManager.getCookie("https://www.terabox.app")
-                    ?: cookieManager.getCookie("https://www.terabox.com")
-                    ?: ""
-                Regex("""\bndus=([^;]+)""").find(cookies)?.groupValues?.get(1)
-            }.getOrNull()
-
+            // 2. Automatic Auto-Detection from Android CookieManager across all candidate domains:
+            val fromCookieManager = scanCookieManagerForNdus()
             if (!fromCookieManager.isNullOrBlank()) {
                 saveNdus(ctx, fromCookieManager)
                 return fromCookieManager
@@ -55,14 +94,26 @@ open class TeraBoxExtractor : ExtractorApi() {
         }
 
         fun saveNdus(context: Context? = null, cookie: String?) {
-            ndusCookie = cookie
-            val ctx = context ?: CommonActivity.activity ?: return
+            val clean = extractNdus(cookie) ?: cookie?.trim()
+            ndusCookie = if (!clean.isNullOrBlank()) clean else null
+            val ctx = context ?: CommonActivity.activity
             runCatching {
-                val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                if (cookie.isNullOrBlank()) {
-                    prefs.edit().remove(KEY_NDUS).apply()
-                } else {
-                    prefs.edit().putString(KEY_NDUS, cookie).apply()
+                if (ctx != null) {
+                    val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    if (clean.isNullOrBlank()) {
+                        prefs.edit().remove(KEY_NDUS).apply()
+                    } else {
+                        prefs.edit().putString(KEY_NDUS, clean).apply()
+                    }
+                }
+                val cm = android.webkit.CookieManager.getInstance()
+                if (!clean.isNullOrBlank()) {
+                    for (domain in CANDIDATE_DOMAINS) {
+                        val host = domain.removePrefix("https://").removePrefix("http://")
+                        val rootDomain = host.substringAfter("www.")
+                        cm.setCookie(domain, "ndus=$clean; domain=.$rootDomain; path=/")
+                    }
+                    cm.flush()
                 }
             }
         }
@@ -240,17 +291,32 @@ open class TeraBoxExtractor : ExtractorApi() {
     ): Boolean {
         return runCatching {
             val surl = extractSurl(rawUrl) ?: return false
-            val listUrl = "https://www.terabox.app/share/list?app_id=250528&shorturl=$surl&root=1"
-            val headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Cookie" to "ndus=$ndus",
-                "Referer" to "https://www.terabox.app/sharing/link?surl=$surl"
-            )
-            val res = app.get(listUrl, headers = headers, timeout = 10).parsedSafe<TeraBoxShareListResponse>() ?: return false
-            val file = res.list?.firstOrNull() ?: return false
-            val dlink = file.dlink
+            val hosts = listOf("www.1024terabox.com", "www.terabox.app", "www.1024tera.com")
+            var file: TeraBoxFileInfo? = null
+            var usedHost = "www.1024terabox.com"
 
-            if (!dlink.isNullOrBlank() && dlink.startsWith("http")) {
+            for (host in hosts) {
+                val listUrl = "https://$host/share/list?app_id=250528&shorturl=$surl&root=1"
+                val headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Cookie" to "ndus=$ndus",
+                    "Referer" to "https://$host/sharing/link?surl=$surl"
+                )
+                val res = runCatching {
+                    app.get(listUrl, headers = headers, timeout = 8).parsedSafe<TeraBoxShareListResponse>()
+                }.getOrNull()
+                val f = res?.list?.firstOrNull()
+                if (f != null && !f.dlink.isNullOrBlank()) {
+                    file = f
+                    usedHost = host
+                    break
+                }
+            }
+
+            if (file == null) return false
+            val dlink = file.dlink ?: return false
+
+            if (dlink.startsWith("http")) {
                 callback(
                     newExtractorLink(
                         source = "$name Direct",
@@ -258,7 +324,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                         url = dlink,
                         type = ExtractorLinkType.VIDEO
                     ) {
-                        this.referer = "https://www.terabox.app/"
+                        this.referer = "https://$usedHost/"
                         this.quality = Qualities.P1080.value
                     }
                 )
