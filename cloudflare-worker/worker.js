@@ -37,24 +37,29 @@ export default {
         service: "terabox-gateway-worker",
         version: "1.0.0",
         usage: {
-          stream: "/?mode=stream&surl={surl}&type={M3U8_AUTO_480|M3U8_AUTO_720|M3U8_AUTO_1080}",
-          proxy: "/proxy?url={encoded_upstream_chunk_url}",
-          resolve: "/?mode=resolve&surl={surl}"
+          proxy: "/proxy?url={encoded_chunk_url}",
+          m3u8: "/m3u8 (POST raw M3U8 text or GET ?url={encoded_m3u8_url})",
+          stream: "/?mode=stream&surl={surl}&type={M3U8_AUTO_480|M3U8_AUTO_720|M3U8_AUTO_1080}"
         }
       });
     }
 
-    // 3. Segment / Chunk Proxy Route
+    // 3. Segment / Chunk Proxy Route (Zero storage, in-flight pipe)
     if (pathname === "/proxy" || pathname === "/segment" || mode === "segment") {
       return handleProxyChunk(request, url);
     }
 
-    // 4. HLS Streaming Manifest Route
+    // 4. M3U8 Manifest Rewriter Route
+    if (pathname === "/m3u8" || mode === "m3u8") {
+      return handleM3u8Rewrite(request, url);
+    }
+
+    // 5. HLS Streaming Manifest Route (Direct)
     if (mode === "stream" || pathname === "/stream") {
       return handleStreamManifest(request, url, env);
     }
 
-    // 5. Direct Link / Metadata Resolver Route
+    // 6. Direct Link / Metadata Resolver Route
     if (mode === "resolve" || pathname === "/resolve") {
       return handleResolve(request, url, env);
     }
@@ -62,6 +67,55 @@ export default {
     return new Response("Not Found", { status: 404 });
   }
 };
+
+/**
+ * Handle M3U8 Manifest Rewriting
+ * Takes an upstream M3U8 (via POST body or GET ?url=) and rewrites all segment URLs
+ * to pass through /proxy?url=... with full CORS & Range support.
+ */
+async function handleM3u8Rewrite(request, url) {
+  let m3u8Text = "";
+
+  if (request.method === "POST") {
+    m3u8Text = await request.text();
+  } else {
+    const targetUrl = url.searchParams.get("url");
+    if (!targetUrl || !targetUrl.startsWith("http")) {
+      return errorResponse("Missing 'url' parameter for GET /m3u8 or POST body", 400);
+    }
+    const res = await fetch(targetUrl, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://dm.terabox.com/"
+      }
+    });
+    m3u8Text = await res.text();
+  }
+
+  if (!m3u8Text.includes("#EXTM3U")) {
+    return errorResponse("Invalid M3U8 playlist content", 400);
+  }
+
+  const workerOrigin = url.origin;
+  const lines = m3u8Text.split("\n");
+  const rewritten = lines.map(line => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      return `${workerOrigin}/proxy?url=${encodeURIComponent(trimmed)}`;
+    }
+    return line;
+  }).join("\n");
+
+  return new Response(rewritten, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Cache-Control": "public, max-age=3600"
+    }
+  });
+}
 
 /**
  * Handle HLS manifest generation and segment rewriting
@@ -76,19 +130,31 @@ async function handleStreamManifest(request, url, env) {
   const ndus = url.searchParams.get("ndus") || env.NDUS_COOKIE || "";
 
   try {
-    const host = "dm.terabox.com";
-    const pageUrl = `https://${host}/sharing/link?surl=${surl}`;
-    const pageHeaders = {
-      "User-Agent": USER_AGENT,
-      ...(ndus ? { "Cookie": `ndus=${ndus}` } : {})
-    };
+    const candidateHosts = ["dm.terabox.com", "dm.1024tera.com", "1024tera.com"];
+    let html = "";
+    let usedHost = "dm.terabox.com";
 
-    const pageRes = await fetch(pageUrl, { headers: pageHeaders });
-    if (!pageRes.ok) {
-      return errorResponse(`Failed to fetch TeraBox share page (HTTP ${pageRes.status})`, pageRes.status);
+    for (const host of candidateHosts) {
+      const pageUrl = `https://${host}/sharing/link?surl=${surl}`;
+      const pageHeaders = {
+        "User-Agent": USER_AGENT,
+        ...(ndus ? { "Cookie": `ndus=${ndus}` } : {})
+      };
+
+      const pageRes = await fetch(pageUrl, { headers: pageHeaders, redirect: "follow" });
+      if (pageRes.ok) {
+        const text = await pageRes.text();
+        if (text.includes("window.__INITIAL_STATE__") || /fn\(['"]([A-F0-9]{64,128})['"]\)/i.test(text)) {
+          html = text;
+          usedHost = host;
+          break;
+        }
+      }
     }
 
-    const html = await pageRes.text();
+    if (!html) {
+      return errorResponse("Failed to load TeraBox sharing page", 502);
+    }
 
     // Extract dynamic jsToken
     const tokenMatch = html.match(/fn\(['"]([A-F0-9]{64,128})['"]\)/i) || html.match(/%22([A-F0-9]{64,128})%22/i);
@@ -125,12 +191,12 @@ async function handleStreamManifest(request, url, env) {
     // If fileInfo wasn't embedded, query share/list
     if (!fid || !path) {
       const tokenParam = jsToken ? `&jsToken=${jsToken}` : "";
-      const listUrl = `https://${host}/share/list?app_id=250528${tokenParam}&shorturl=${surl}&root=1`;
+      const listUrl = `https://${usedHost}/share/list?app_id=250528${tokenParam}&shorturl=${surl}&root=1`;
       const listRes = await fetch(listUrl, {
         headers: {
           "User-Agent": USER_AGENT,
           ...(ndus ? { "Cookie": `ndus=${ndus}` } : {}),
-          "Referer": pageUrl
+          "Referer": `https://${usedHost}/sharing/link?surl=${surl}`
         }
       });
       const parsed = await listRes.json();
@@ -148,12 +214,12 @@ async function handleStreamManifest(request, url, env) {
     async function queryStreaming(qType) {
       const pathEnc = encodeURIComponent(path);
       const tokenParam = jsToken ? `&jsToken=${jsToken}` : "";
-      const streamUrl = `https://${host}/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=${surl}&root=1&type=${qType}&path=${pathEnc}${tokenParam}&uk=${uk}&shareid=${shareid}&fid=${fid}&sign=${sign}&timestamp=${timestamp}`;
+      const streamUrl = `https://${usedHost}/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=${surl}&root=1&type=${qType}&path=${pathEnc}${tokenParam}&uk=${uk}&shareid=${shareid}&fid=${fid}&sign=${sign}&timestamp=${timestamp}`;
       return await fetch(streamUrl, {
         headers: {
           "User-Agent": USER_AGENT,
           ...(ndus ? { "Cookie": `ndus=${ndus}` } : {}),
-          "Referer": pageUrl
+          "Referer": `https://${usedHost}/sharing/link?surl=${surl}`
         }
       });
     }
@@ -258,7 +324,6 @@ async function handleResolve(request, url, env) {
   const host = "dm.terabox.com";
 
   try {
-    const tokenParam = "";
     const listUrl = `https://${host}/share/list?app_id=250528&shorturl=${surl}&root=1`;
     const res = await fetch(listUrl, {
       headers: {
