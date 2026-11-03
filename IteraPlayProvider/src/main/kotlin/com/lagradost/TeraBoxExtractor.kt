@@ -210,7 +210,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                 target,
                 headers = headers,
                 json = mapOf("url" to fullTeraBoxUrl),
-                timeout = 6
+                timeout = 20
             ).parsedSafe<IteraPlayInImportResponse>()
 
             val videos = res?.videos
@@ -429,11 +429,25 @@ open class TeraBoxExtractor : ExtractorApi() {
                         "Accept" to "*/*",
                         "Connection" to "keep-alive"
                     )
+
+                    // Pre-resolve 302 redirect directly to the edge CDN node (e.g. d.terabox.app)
+                    // This prevents ExoPlayer / Cronet net_error -101 (ERR_CONNECTION_RESET) on dm-d.terabox.com
+                    val finalStreamUrl = runCatching {
+                        val step = app.get(
+                            dlink,
+                            headers = headersMap,
+                            allowRedirects = false,
+                            timeout = 5
+                        )
+                        val loc = step.headers["Location"] ?: step.headers["location"]
+                        if (!loc.isNullOrBlank() && loc.startsWith("http")) loc else dlink
+                    }.getOrDefault(dlink)
+
                     callback(
                         newExtractorLink(
                             source = "$name Direct",
                             name = "$name - [1080p Official 🚀]",
-                            url = dlink,
+                            url = finalStreamUrl,
                             type = ExtractorLinkType.VIDEO
                         ) {
                             this.referer = "https://www.1024terabox.com/"
