@@ -34,13 +34,13 @@ Fetching JAR: cloudstream.jar
 > Task :IteraPlayProvider:preBuild UP-TO-DATE
 > Task :IteraPlayProvider:preDebugBuild UP-TO-DATE
 > Task :IteraPlayProvider:generateDebugResValues
-> Task :IteraPlayProvider:generateDebugResources
 > Task :WaveFlixProvider:parseDebugLocalResources
 > Task :AnimePaheProvider:parseDebugLocalResources
+> Task :IteraPlayProvider:generateDebugResources
 > Task :IteraPlayProvider:packageDebugResources
 > Task :WaveFlixProvider:generateDebugRFile
-> Task :AnimePaheProvider:generateDebugRFile
 > Task :IteraPlayProvider:parseDebugLocalResources
+> Task :AnimePaheProvider:generateDebugRFile
 > Task :IteraPlayProvider:generateDebugRFile
 
 > Task :IteraPlayProvider:compileDebugKotlin
@@ -7357,5 +7357,5 @@ Made CloudStream package at /home/runner/work/csext/csext/src/WaveFlixProvider/b
 > Task :makePluginsJson
 Created /home/runner/work/csext/csext/src/build/plugins.json
 
-BUILD SUCCESSFUL in 2m 32s
+BUILD SUCCESSFUL in 1m 37s
 31 actionable tasks: 31 executed

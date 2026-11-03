@@ -23,10 +23,10 @@
     },
     {
         "iconUrl": "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png",
-        "fileHash": "sha256-204ab2b61c27ff0c3d15c2e3f3113d2a335a50645176a28b965477c0de480fd5",
+        "fileHash": "sha256-b0af014f80bac82507c5b2a3a045ea0a1e4acf8e76c15e120ac440242d32e204",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Adiversion/csext",
-        "fileSize": 60066,
+        "fileSize": 61452,
         "status": 1,
         "language": "en",
         "authors": [
@@ -36,7 +36,7 @@
             "Movie",
             "Others"
         ],
-        "version": 11,
+        "version": 12,
         "internalName": "IteraPlayProvider",
         "description": "iTeraPlay viral & premium TeraBox streaming player provider.",
         "url": "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlayProvider.cs3",
