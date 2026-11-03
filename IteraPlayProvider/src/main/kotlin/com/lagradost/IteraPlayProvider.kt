@@ -27,10 +27,11 @@ class IteraPlayProvider : MainAPI() {
         private const val KEY_REMEMBER_ME = "remember_me_cookie"
 
         @Volatile var authCookie: String? = null
+        @Volatile var appContext: Context? = null
 
         fun getSavedCookie(context: Context? = null): String? {
             if (!authCookie.isNullOrBlank()) return authCookie
-            val ctx = context ?: CommonActivity.activity ?: return null
+            val ctx = context ?: appContext ?: CommonActivity.activity ?: return null
             return runCatching {
                 val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 val c = prefs.getString(KEY_REMEMBER_ME, null)
@@ -41,7 +42,7 @@ class IteraPlayProvider : MainAPI() {
 
         fun saveCookie(context: Context? = null, cookie: String?) {
             authCookie = cookie
-            val ctx = context ?: CommonActivity.activity ?: return
+            val ctx = context ?: appContext ?: CommonActivity.activity ?: return
             runCatching {
                 val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 if (cookie.isNullOrBlank()) {

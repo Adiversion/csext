@@ -22,6 +22,7 @@ open class TeraBoxExtractor : ExtractorApi() {
 
         @Volatile var ndusCookie: String? = null
         @Volatile var customWorkerUrl: String? = null
+        @Volatile var appContext: Context? = null
 
         val CANDIDATE_DOMAINS = listOf(
             "https://www.1024terabox.com",
@@ -79,7 +80,7 @@ open class TeraBoxExtractor : ExtractorApi() {
 
         fun getSavedNdus(context: Context? = null): String? {
             if (!ndusCookie.isNullOrBlank()) return ndusCookie
-            val ctx = context ?: CommonActivity.activity
+            val ctx = context ?: appContext ?: CommonActivity.activity
 
             // 1. Check SharedPreferences
             val fromPrefs = runCatching {
@@ -105,7 +106,7 @@ open class TeraBoxExtractor : ExtractorApi() {
         fun saveNdus(context: Context? = null, cookie: String?) {
             val clean = extractNdus(cookie) ?: cookie?.trim()
             ndusCookie = if (!clean.isNullOrBlank()) clean else null
-            val ctx = context ?: CommonActivity.activity
+            val ctx = context ?: appContext ?: CommonActivity.activity
             runCatching {
                 if (ctx != null) {
                     val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -129,7 +130,7 @@ open class TeraBoxExtractor : ExtractorApi() {
 
         fun getSavedCustomWorker(context: Context? = null): String? {
             if (!customWorkerUrl.isNullOrBlank()) return customWorkerUrl
-            val ctx = context ?: CommonActivity.activity ?: return null
+            val ctx = context ?: appContext ?: CommonActivity.activity ?: return null
             return runCatching {
                 val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 val w = prefs.getString(KEY_CUSTOM_WORKER, null)
@@ -140,7 +141,7 @@ open class TeraBoxExtractor : ExtractorApi() {
 
         fun saveCustomWorker(context: Context? = null, worker: String?) {
             customWorkerUrl = worker
-            val ctx = context ?: CommonActivity.activity ?: return
+            val ctx = context ?: appContext ?: CommonActivity.activity ?: return
             runCatching {
                 val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 if (worker.isNullOrBlank()) {
@@ -170,26 +171,21 @@ open class TeraBoxExtractor : ExtractorApi() {
         val ndus = getSavedNdus()
         val customWorker = getSavedCustomWorker()
 
-        // Run ALL enabled resolvers concurrently in parallel:
-        // No resolver blocks any other resolver. High-definition multi-quality resolvers (iTeraPlay.in) emit true 1080p/720p HLS & MP4.
-        // Direct TeraBox (with ndus) emits official 1080p direct links with full unthrottled streaming headers.
-        coroutineScope {
-            val jobDirect = if (!ndus.isNullOrBlank()) async {
-                resolveDirectTeraBox(cleanUrl, ndus, callback)
-            } else null
-
-            val jobWorker = if (!customWorker.isNullOrBlank()) async {
-                resolveViaCustomWorker(cleanUrl, customWorker, callback)
-            } else null
-
-            val jobIn = async {
-                resolveViaIteraPlayIn(cleanUrl, callback)
-            }
-
-            jobDirect?.await()
-            jobWorker?.await()
-            jobIn.await()
+        // 1. Direct Official TeraBox (Fastest 1080p, bypasses all 3rd party sites)
+        // If user is logged in with ndus, resolve directly via TeraBox CDN first!
+        if (!ndus.isNullOrBlank()) {
+            val directFound = resolveDirectTeraBox(cleanUrl, ndus, callback)
+            if (directFound) return
         }
+
+        // 2. Private Gateway Worker (if configured)
+        if (!customWorker.isNullOrBlank()) {
+            val workerFound = resolveViaCustomWorker(cleanUrl, customWorker, callback)
+            if (workerFound) return
+        }
+
+        // 3. Fallback to free upstream (iTeraPlay.in Multi-Quality 1080p Engine)
+        resolveViaIteraPlayIn(cleanUrl, callback)
     }
 
     private suspend fun resolveViaIteraPlayIn(

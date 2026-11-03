@@ -25,10 +25,15 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class IteraPlayPlugin : Plugin() {
     override fun load(context: Context) {
+        // Initialize persistent application context
+        val appCtx = context.applicationContext ?: context
+        TeraBoxExtractor.appContext = appCtx
+        IteraPlayProvider.appContext = appCtx
+
         // Initialize saved settings if present
-        IteraPlayProvider.getSavedCookie(context)
-        TeraBoxExtractor.getSavedNdus(context)
-        TeraBoxExtractor.getSavedCustomWorker(context)
+        IteraPlayProvider.getSavedCookie(appCtx)
+        TeraBoxExtractor.getSavedNdus(appCtx)
+        TeraBoxExtractor.getSavedCustomWorker(appCtx)
 
         // Register the IteraPlay MainAPI provider
         registerMainAPI(IteraPlayProvider())
