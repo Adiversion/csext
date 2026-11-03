@@ -96,7 +96,7 @@ class IteraPlayProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
-        if (cleanQuery.isBlank()) return emptyList()
+        if (cleanQuery.isEmpty()) return emptyList()
 
         // 1. Direct TeraBox Link Handling:
         if (cleanQuery.contains("terabox") || cleanQuery.contains("1024tera")) {
@@ -119,14 +119,14 @@ class IteraPlayProvider : MainAPI() {
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
         val cookie = getSavedCookie()
         val (targetUrl, reqHeaders) = if (!cookie.isNullOrBlank()) {
-            "$mainUrl/api/home/search?q=$encodedQuery&sort=&limit=20&offset=0&quality=&duration=" to mapOf(
+            "$mainUrl/api/home/search?q=$encodedQuery&sort=&limit=25&offset=0" to mapOf(
                 "User-Agent" to USER_AGENT,
-                "Referer" to "$mainUrl/premium-videos",
+                "Referer" to "$mainUrl/",
                 "Cookie" to "remember_me=$cookie",
                 "Accept" to "application/json, text/plain, */*"
             )
         } else {
-            "$altCatalogUrl/api/home/search?q=$encodedQuery&sort=&limit=20&offset=0&quality=&duration=" to mapOf(
+            "$altCatalogUrl/api/home/search?q=$encodedQuery&sort=&limit=25&offset=0" to mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer" to "$altCatalogUrl/",
                 "Accept" to "application/json, text/plain, */*"
@@ -158,8 +158,16 @@ class IteraPlayProvider : MainAPI() {
         val title = linkData?.title ?: "Video #$videoId"
         val poster = linkData?.poster ?: "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
 
-        // If terabox URL wasn't embedded in thumbnail, fallback to access API:
-        if (teraboxUrl.isNullOrBlank()) {
+        // 1. If terabox URL wasn't validly embedded in thumbnail, attempt catalog alternative search by title
+        if (teraboxUrl.isNullOrBlank() || teraboxUrl.contains("thumb_")) {
+            val altUrl = resolveAlternativeTeraBoxUrl(title)
+            if (!altUrl.isNullOrBlank()) {
+                teraboxUrl = altUrl
+            }
+        }
+
+        // 2. If still blank, fallback to iteraplay video access API:
+        if (teraboxUrl.isNullOrBlank() || teraboxUrl.contains("thumb_")) {
             val cookie = getSavedCookie()
             val accessUrl = "$mainUrl/api/video/access/$videoId"
             val headers = mutableMapOf(
@@ -168,6 +176,7 @@ class IteraPlayProvider : MainAPI() {
                 "Referer" to "$mainUrl/"
             )
             if (!cookie.isNullOrBlank()) {
+                headers["Authorization"] = "Bearer $cookie"
                 headers["Cookie"] = "remember_me=$cookie"
             }
             val accessRes = runCatching {
@@ -181,7 +190,10 @@ class IteraPlayProvider : MainAPI() {
                     timeout = 10
                 ).parsedSafe<IteraAccessResponse>()
             }.getOrNull()
-            teraboxUrl = accessRes?.url
+
+            if (!accessRes?.url.isNullOrBlank() && accessRes?.url?.contains("thumb_") != true) {
+                teraboxUrl = accessRes?.url
+            }
         }
 
         val resolvedLinkData = IteraLinkData(
@@ -213,37 +225,53 @@ class IteraPlayProvider : MainAPI() {
 
         var teraboxUrl = linkData.teraboxUrl
 
-        // If terabox URL wasn't retrieved in load(), attempt access one more time:
-        if (teraboxUrl.isNullOrBlank() && linkData.videoId != null) {
-            val cookie = getSavedCookie()
-            val accessUrl = "$mainUrl/api/video/access/${linkData.videoId}"
-            val headers = mutableMapOf(
-                "Content-Type" to "application/json",
-                "User-Agent" to USER_AGENT,
-                "Referer" to "$mainUrl/"
-            )
-            if (!cookie.isNullOrBlank()) {
-                headers["Cookie"] = "remember_me=$cookie"
+        // 1. If terabox URL is missing or points to a non-video thumbnail slug, resolve via alternative search
+        if (teraboxUrl.isNullOrBlank() || teraboxUrl.contains("thumb_")) {
+            if (!linkData.title.isNullOrBlank()) {
+                val altUrl = resolveAlternativeTeraBoxUrl(linkData.title)
+                if (!altUrl.isNullOrBlank()) {
+                    teraboxUrl = altUrl
+                }
             }
-            val accessRes = runCatching {
-                app.post(
-                    accessUrl,
-                    headers = headers,
-                    json = mapOf(
-                        "type" to "play",
-                        "fingerprint" to "1bb52e836da743a0bad8bfcdd8020526"
-                    ),
-                    timeout = 10
-                ).parsedSafe<IteraAccessResponse>()
-            }.getOrNull()
-            teraboxUrl = accessRes?.url
         }
 
-        if (teraboxUrl.isNullOrBlank()) {
+        // 2. If still missing, attempt video access API
+        if (teraboxUrl.isNullOrBlank() || teraboxUrl.contains("thumb_")) {
+            if (linkData.videoId != null) {
+                val cookie = getSavedCookie()
+                val accessUrl = "$mainUrl/api/video/access/${linkData.videoId}"
+                val headers = mutableMapOf(
+                    "Content-Type" to "application/json",
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to "$mainUrl/"
+                )
+                if (!cookie.isNullOrBlank()) {
+                    headers["Authorization"] = "Bearer $cookie"
+                    headers["Cookie"] = "remember_me=$cookie"
+                }
+                val accessRes = runCatching {
+                    app.post(
+                        accessUrl,
+                        headers = headers,
+                        json = mapOf(
+                            "type" to "play",
+                            "fingerprint" to "1bb52e836da743a0bad8bfcdd8020526"
+                        ),
+                        timeout = 10
+                    ).parsedSafe<IteraAccessResponse>()
+                }.getOrNull()
+
+                if (!accessRes?.url.isNullOrBlank() && accessRes?.url?.contains("thumb_") != true) {
+                    teraboxUrl = accessRes?.url
+                }
+            }
+        }
+
+        if (teraboxUrl.isNullOrBlank() || teraboxUrl.contains("thumb_")) {
             return false
         }
 
-        // Delegate to registered TeraBox extractors (TeraVideo Native HLS + LinkPlay 1080p MP4)
+        // Delegate to registered TeraBox extractors (iTeraPlay.in Multi-HLS/MP4 + TeraVideo Adaptive HLS)
         var foundLinks = false
         val customCallback: (ExtractorLink) -> Unit = { link ->
             foundLinks = true
@@ -257,13 +285,48 @@ class IteraPlayProvider : MainAPI() {
         return foundLinks
     }
 
+    private suspend fun resolveAlternativeTeraBoxUrl(rawTitle: String): String? {
+        val clean = rawTitle.removeSuffix(".mp4")
+            .replace(Regex("""\([^)]*\)"""), "")
+            .replace(Regex("""\[[^\]]*\]"""), "")
+            .replace(Regex("""[-_]"""), " ")
+            .trim()
+        if (clean.length < 3) return null
+
+        val catalog = runCatching {
+            val encoded = URLEncoder.encode(clean, "UTF-8")
+            val res = app.get(
+                "$altCatalogUrl/api/home/search?q=$encoded&sort=&limit=15&offset=0",
+                headers = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to "$altCatalogUrl/"
+                ),
+                timeout = 10
+            ).parsedSafe<IteraEncryptedResponse>()
+            val encData = res?.data ?: return@runCatching null
+            val decJson = IteraPlayCrypto.decrypt(encData) ?: return@runCatching null
+            parseJson<IteraDecryptedCatalog>(decJson)
+        }.getOrNull()
+
+        val list = catalog?.list ?: return null
+        for (item in list) {
+            val thumb = item.thumbnail ?: continue
+            val key = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
+                ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
+            if (!key.isNullOrBlank() && !key.startsWith("thumb_")) {
+                return "https://terabox.app/s/$key"
+            }
+        }
+        return null
+    }
+
     private fun IteraVideoItem.toSearchResponse(baseUrl: String): SearchResponse? {
         val id = this.id ?: return null
         val title = this.fileName?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "Video #$id"
         val thumb = this.thumbnail ?: ""
         val teraboxKey = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
-            ?: Regex("""(?:fid=|\/)([a-zA-Z0-9_\-]{15,})""").find(thumb)?.groupValues?.get(1)
-        val teraboxUrl = if (teraboxKey != null) "https://terabox.app/s/$teraboxKey" else null
+            ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
+        val teraboxUrl = if (teraboxKey != null && !teraboxKey.startsWith("thumb_")) "https://terabox.app/s/$teraboxKey" else null
 
         val linkData = IteraLinkData(
             videoId = id,

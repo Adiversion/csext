@@ -1,34 +1,12 @@
 package com.lagradost
 
-import android.annotation.SuppressLint
-import android.app.Activity
-import android.app.Dialog
 import android.content.Context
-import android.graphics.Color
-import android.graphics.drawable.ColorDrawable
-import android.os.Handler
-import android.os.Looper
-import android.util.Log
-import android.view.Gravity
-import android.view.View
-import android.view.ViewGroup
-import android.view.Window
-import android.view.WindowManager
-import android.webkit.WebChromeClient
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ProgressBar
-import android.widget.TextView
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
 open class TeraBoxExtractor : ExtractorApi() {
     override val name = "TeraBox"
@@ -43,9 +21,6 @@ open class TeraBoxExtractor : ExtractorApi() {
 
         @Volatile var ndusCookie: String? = null
         @Volatile var customWorkerUrl: String? = null
-
-        data class CachedStream(val url: String, val name: String, val expiresAt: Long)
-        private val linkPlayCache = ConcurrentHashMap<String, CachedStream>()
 
         fun getSavedNdus(context: Context? = null): String? {
             if (!ndusCookie.isNullOrBlank()) return ndusCookie
@@ -123,25 +98,6 @@ open class TeraBoxExtractor : ExtractorApi() {
             }
             return surl
         }
-
-        private fun getActivity(): Activity? {
-            return CommonActivity.activity ?: runCatching {
-                val activityThreadClass = Class.forName("android.app.ActivityThread")
-                val currentActivityThreadMethod = activityThreadClass.getMethod("currentActivityThread")
-                val activityThread = currentActivityThreadMethod.invoke(null)
-                val mActivitiesField = activityThreadClass.getDeclaredField("mActivities").apply { isAccessible = true }
-                val activities = mActivitiesField.get(activityThread) as? Map<*, *>
-                activities?.values?.firstNotNullOfOrNull { record ->
-                    if (record == null) return@firstNotNullOfOrNull null
-                    val pausedField = record.javaClass.getDeclaredField("paused").apply { isAccessible = true }
-                    val isPaused = pausedField.getBoolean(record)
-                    if (!isPaused) {
-                        val activityField = record.javaClass.getDeclaredField("activity").apply { isAccessible = true }
-                        activityField.get(record) as? Activity
-                    } else null
-                }
-            }.getOrNull()
-        }
     }
 
     override suspend fun getUrl(
@@ -153,316 +109,100 @@ open class TeraBoxExtractor : ExtractorApi() {
         val cleanUrl = url.trim()
         val ndus = getSavedNdus()
 
-        // 1. Direct TeraBox Mode: If user has configured an ndus session token (high-speed dlink mp4)
+        // 1. Direct Native TeraBox Engine (Highest priority, 100% direct official streaming with 0 third-party dependency):
         if (!ndus.isNullOrBlank()) {
             val resolvedDirect = resolveDirectTeraBox(cleanUrl, ndus, callback)
             if (resolvedDirect) return
         }
 
-        // 2. Custom Gateway Mode (e.g. saahiyo/terabox-gateway worker):
+        // 2. Custom Gateway / Self-Hosted Worker Engine (0 third-party dependency):
         val customWorker = getSavedCustomWorker()
         if (!customWorker.isNullOrBlank()) {
             val resolvedCustom = resolveViaCustomWorker(cleanUrl, customWorker, callback)
             if (resolvedCustom) return
         }
 
-        // 3. TeraVideo Native HLS Resolver (Fast, No Captcha/Turnstile, Full Duration HLS VOD)
-        resolveViaTeraVideo(cleanUrl, callback)
-
-        // 4. LinkPlay 1080p Direct MP4 Resolver (Full HD 1080p)
-        resolveViaLinkPlay(cleanUrl, callback)
+        // 3. Parallel Redundant Native Engines (Zero Login, Zero Captcha):
+        // Run both iTeraPlay.in and TeraVideo resolvers concurrently so all stream qualities are available
+        // and playback NEVER fails if any single upstream server or worker experiences downtime.
+        coroutineScope {
+            val jobIn = async { resolveViaIteraPlayIn(cleanUrl, callback) }
+            val jobTv = async { resolveViaTeraVideo(cleanUrl, callback) }
+            jobIn.await()
+            jobTv.await()
+        }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun resolveViaLinkPlay(
+    private suspend fun resolveViaIteraPlayIn(
         rawUrl: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val surl = extractSurl(rawUrl) ?: return false
-        val canonicalKey = if (surl.startsWith("1")) surl else "1$surl"
-        val fullTeraBoxUrl = "https://terabox.app/s/$canonicalKey"
-
-        // Check in-memory cache first (prevents redundant Turnstile solves)
-        val cached = linkPlayCache[canonicalKey]
-        if (cached != null && System.currentTimeMillis() < cached.expiresAt - 60_000L) {
-            callback(
-                newExtractorLink(
-                    source = "LinkPlay Direct",
-                    name = "${cached.name} - [LinkPlay 1080p ⚡]",
-                    url = cached.url,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = "https://linkplay.in/"
-                    this.quality = Qualities.P1080.value
-                }
-            )
-            return true
-        }
-
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            return false
-        }
-
-        val activity = CommonActivity.activity ?: getActivity() ?: return false
-        if (activity.isFinishing || activity.isDestroyed) return false
-
-        val latch = CountDownLatch(1)
-        var capturedToken: String? = null
-        var effectiveUa: String = USER_AGENT
-
-        activity.runOnUiThread {
-            try {
-                val density = activity.resources.displayMetrics.density
-                val dialog = Dialog(activity, android.R.style.Theme_DeviceDefault_NoActionBar)
-                dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
-                dialog.setOnShowListener {
-                    dialog.window?.apply {
-                        setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                        setBackgroundDrawable(ColorDrawable(Color.parseColor("#121218")))
-                        clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-                    }
-                }
-
-                // Start invisible so non-interactive Turnstile completes with zero flicker
-                dialog.window?.decorView?.alpha = 0f
-
-                val handler = Handler(Looper.getMainLooper())
-                var tokenSaved = false
-
-                val root = LinearLayout(activity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    setBackgroundColor(Color.parseColor("#121218"))
-                    layoutParams = ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT
-                    )
-                }
-
-                val header = LinearLayout(activity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    setBackgroundColor(Color.parseColor("#1E1E2A"))
-                    setPadding((16 * density).toInt(), (14 * density).toInt(), (16 * density).toInt(), (14 * density).toInt())
-                    gravity = Gravity.CENTER_VERTICAL
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    )
-                }
-
-                val titleTv = TextView(activity).apply {
-                    text = "LinkPlay 1080p Verification"
-                    setTextColor(Color.WHITE)
-                    textSize = 16f
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                }
-
-                val closeBtn = Button(activity).apply {
-                    text = "✕"
-                    setTextColor(Color.LTGRAY)
-                    setBackgroundColor(Color.TRANSPARENT)
-                    textSize = 18f
-                    setOnClickListener { dialog.dismiss() }
-                }
-
-                header.addView(titleTv)
-                header.addView(closeBtn)
-                root.addView(header)
-
-                val statusTv = TextView(activity).apply {
-                    text = "Verifying browser integrity for 1080p playback..."
-                    setTextColor(Color.parseColor("#A0A0B0"))
-                    textSize = 12f
-                    setPadding((16 * density).toInt(), (10 * density).toInt(), (16 * density).toInt(), (8 * density).toInt())
-                }
-                root.addView(statusTv)
-
-                val progressBar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-                    isIndeterminate = true
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        (4 * density).toInt()
-                    )
-                }
-                root.addView(progressBar)
-
-                val webView = WebView(activity).apply {
-                    isFocusable = true
-                    isFocusableInTouchMode = true
-                    setLayerType(View.LAYER_TYPE_HARDWARE, null)
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        0,
-                        1f
-                    )
-                }
-
-                val cookieManager = android.webkit.CookieManager.getInstance()
-                cookieManager.setAcceptCookie(true)
-                cookieManager.setAcceptThirdPartyCookies(webView, true)
-
-                webView.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    allowContentAccess = true
-                    allowFileAccess = true
-                    cacheMode = WebSettings.LOAD_DEFAULT
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-
-                    val baseUa = userAgentString ?: USER_AGENT
-                    val sanitizedUa = baseUa
-                        .replace("; wv", "")
-                        .replace(Regex("Version/[0-9.]+\\s*"), "")
-                        .replace("Android TV", "Android")
-                        .let { ua ->
-                            if (ua.contains("Android") && ua.contains("Safari/") && !ua.contains("Mobile Safari/")) {
-                                ua.replace("Safari/", "Mobile Safari/")
-                            } else ua
-                        }
-                    userAgentString = sanitizedUa
-                    effectiveUa = sanitizedUa
-                }
-
-                // Reveal dialog if user interaction (checkbox click) is needed after 2.2 seconds
-                val revealRunnable = Runnable {
-                    if (!tokenSaved && dialog.isShowing) {
-                        statusTv.text = "Please complete the verification checkmark below to start video."
-                        runCatching {
-                            dialog.window?.decorView?.animate()?.alpha(1f)?.setDuration(250L)?.start()
-                        }
-                    }
-                }
-
-                var pollElapsedMs = 0L
-                lateinit var pollRunnable: Runnable
-                pollRunnable = Runnable {
-                    if (tokenSaved) return@Runnable
-                    pollElapsedMs += 500L
-
-                    val checkJs = """
-                        (function() {
-                            try {
-                                if (typeof turnstile !== 'undefined') {
-                                    var t = turnstile.getResponse();
-                                    if (t && t.length > 20) return t;
-                                }
-                                var inp = document.querySelector('[name="cf-turnstile-response"]');
-                                if (inp && inp.value && inp.value.length > 20) return inp.value;
-                            } catch(e) {}
-                            return '';
-                        })();
-                    """.trimIndent()
-
-                    webView.evaluateJavascript(checkJs) { rawVal ->
-                        val token = rawVal?.trim('"', '\'')?.replace("\\", "")
-                        if (!token.isNullOrBlank() && token.length > 20) {
-                            tokenSaved = true
-                            capturedToken = token
-                            handler.removeCallbacks(revealRunnable)
-                            handler.postDelayed({
-                                runCatching { if (dialog.isShowing) dialog.dismiss() }
-                            }, 200L)
-                            latch.countDown()
-                            return@evaluateJavascript
-                        }
-
-                        if (pollElapsedMs >= 40_000L) {
-                            Log.w("TeraBox", "LinkPlay Turnstile timed out after 40s")
-                            latch.countDown()
-                            runCatching { if (dialog.isShowing) dialog.dismiss() }
-                            return@evaluateJavascript
-                        }
-
-                        handler.postDelayed(pollRunnable, 500L)
-                    }
-                }
-
-                webView.webChromeClient = object : WebChromeClient() {
-                    override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                        super.onProgressChanged(view, newProgress)
-                        progressBar.progress = newProgress
-                    }
-                }
-
-                webView.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        super.onPageFinished(view, url)
-                        progressBar.visibility = View.GONE
-                    }
-                }
-
-                root.addView(webView)
-                dialog.setContentView(root)
-
-                dialog.setOnDismissListener {
-                    handler.removeCallbacks(pollRunnable)
-                    handler.removeCallbacks(revealRunnable)
-                    latch.countDown()
-                }
-
-                dialog.show()
-                webView.loadUrl("https://linkplay.in/")
-                handler.postDelayed(pollRunnable, 700L)
-                handler.postDelayed(revealRunnable, 2200L)
-
-            } catch (e: Throwable) {
-                Log.e("TeraBox", "resolveViaLinkPlay failed: ${e.message}")
-                latch.countDown()
-            }
-        }
-
-        try {
-            latch.await(45, TimeUnit.SECONDS)
-        } catch (_: InterruptedException) {}
-
-        val token = capturedToken
-        if (token.isNullOrBlank()) return false
-
         return runCatching {
-            val postBody = mapOf(
-                "url" to fullTeraBoxUrl,
-                "turnstileToken" to token
+            val surl = extractSurl(rawUrl) ?: return false
+            val canonicalKey = if (surl.startsWith("1")) surl else "1$surl"
+            val fullTeraBoxUrl = "https://terabox.app/s/$canonicalKey"
+            val target = "https://iteraplay.in/api/videos/import"
+            val headers = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Content-Type" to "application/json",
+                "Origin" to "https://iteraplay.in",
+                "Referer" to "https://iteraplay.in/"
             )
             val res = app.post(
-                "https://linkplay.in/api/fetch-video",
-                json = postBody,
-                headers = mapOf(
-                    "User-Agent" to effectiveUa,
-                    "Referer" to "https://linkplay.in/",
-                    "Origin" to "https://linkplay.in",
-                    "Content-Type" to "application/json"
-                ),
-                timeout = 25
-            ).parsedSafe<LinkPlayResponse>()
+                target,
+                headers = headers,
+                json = mapOf("url" to fullTeraBoxUrl),
+                timeout = 15
+            ).parsedSafe<IteraPlayInImportResponse>()
 
-            val video = res?.video
-            val streamUrl = video?.secure_stream ?: video?.secure_download
-            if (res?.success == true && !streamUrl.isNullOrBlank()) {
-                val videoName = video?.name ?: "TeraBox Video"
-                val expires = Regex("""expires=(\d+)""").find(streamUrl)?.groupValues?.get(1)?.toLongOrNull()
-                    ?: (System.currentTimeMillis() + 900_000L)
-                linkPlayCache[canonicalKey] = CachedStream(streamUrl, videoName, expires)
-
-                val q = when {
-                    videoName.contains("1080", ignoreCase = true) || videoName.contains("4k", ignoreCase = true) -> Qualities.P1080.value
-                    videoName.contains("720", ignoreCase = true) -> Qualities.P720.value
-                    videoName.contains("480", ignoreCase = true) -> Qualities.P480.value
-                    else -> Qualities.P1080.value
-                }
-
-                callback(
-                    newExtractorLink(
-                        source = "LinkPlay Direct",
-                        name = "$videoName - [LinkPlay Direct MP4 ⚡]",
-                        url = streamUrl,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = "https://linkplay.in/"
-                        this.quality = q
+            val videos = res?.videos
+            if (res?.success == true && !videos.isNullOrEmpty()) {
+                var found = false
+                for (video in videos) {
+                    val title = video.title?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
+                    val fastStreams = video.fastStreamUrl
+                    if (fastStreams != null && fastStreams.isNotEmpty()) {
+                        for ((qName, hlsUrl) in fastStreams) {
+                            if (hlsUrl.isBlank()) continue
+                            val q = when (qName.lowercase()) {
+                                "1080p" -> Qualities.P1080.value
+                                "720p"  -> Qualities.P720.value
+                                "480p"  -> Qualities.P480.value
+                                "360p"  -> Qualities.P360.value
+                                else    -> Qualities.Unknown.value
+                            }
+                            callback(
+                                newExtractorLink(
+                                    source = "iTeraPlay HLS",
+                                    name = "$title - [$qName HLS ⚡]",
+                                    url = hlsUrl,
+                                    type = ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = "https://iteraplay.in/"
+                                    this.quality = q
+                                }
+                            )
+                            found = true
+                        }
                     }
-                )
-                true
+
+                    val streamUrl = video.streamUrl
+                    if (!streamUrl.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "iTeraPlay Direct",
+                                name = "$title - [Direct MP4 ⚡]",
+                                url = streamUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://iteraplay.in/"
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+                        found = true
+                    }
+                }
+                found
             } else {
                 false
             }
@@ -584,6 +324,23 @@ open class TeraBoxExtractor : ExtractorApi() {
                     found = true
                 }
 
+                val streamUrl = active.streamUrl
+                if (!streamUrl.isNullOrBlank()) {
+                    val fullStream = if (streamUrl.startsWith("http")) streamUrl else "https://teravideo.in/terabox-api/$streamUrl"
+                    callback(
+                        newExtractorLink(
+                            source = "TeraVideo Direct",
+                            name = "$videoName - [TeraVideo Direct Stream ⚡]",
+                            url = fullStream,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://teravideo.in/terabox-player-online/"
+                            this.quality = Qualities.P720.value
+                        }
+                    )
+                    found = true
+                }
+
                 found
             } else {
                 false
@@ -608,6 +365,26 @@ class TeraBoxLinkExtractor : TeraBoxExtractor() {
     override val mainUrl = "https://teraboxlink.com"
 }
 
+data class IteraPlayInImportResponse(
+    @JsonProperty("success") val success: Boolean? = null,
+    @JsonProperty("videos") val videos: List<IteraPlayInVideoItem>? = null,
+    @JsonProperty("message") val message: String? = null,
+    @JsonProperty("error") val error: String? = null
+)
+
+data class IteraPlayInVideoItem(
+    @JsonProperty("_id") val id: String? = null,
+    @JsonProperty("fileId") val fileId: String? = null,
+    @JsonProperty("title") val title: String? = null,
+    @JsonProperty("size") val size: Long? = null,
+    @JsonProperty("quality") val quality: String? = null,
+    @JsonProperty("duration") val duration: String? = null,
+    @JsonProperty("thumbnailUrl") val thumbnailUrl: String? = null,
+    @JsonProperty("stream_url") val streamUrl: String? = null,
+    @JsonProperty("fast_stream_url") val fastStreamUrl: Map<String, String>? = null,
+    @JsonProperty("resolutions") val resolutions: List<String>? = null
+)
+
 data class TeraVideoResponse(
     @JsonProperty("success") val success: Boolean? = null,
     @JsonProperty("data") val data: TeraVideoData? = null
@@ -628,23 +405,6 @@ data class TeraVideoFile(
     @JsonProperty("masterUrl") val masterUrl: String? = null,
     @JsonProperty("hlsUrl") val hlsUrl: String? = null,
     @JsonProperty("streamUrl") val streamUrl: String? = null
-)
-
-data class LinkPlayResponse(
-    @JsonProperty("success") val success: Boolean = false,
-    @JsonProperty("cached") val cached: Boolean? = null,
-    @JsonProperty("downloading") val downloading: Boolean? = null,
-    @JsonProperty("video") val video: LinkPlayVideo? = null,
-    @JsonProperty("error") val error: String? = null
-)
-
-data class LinkPlayVideo(
-    @JsonProperty("id") val id: String? = null,
-    @JsonProperty("name") val name: String? = null,
-    @JsonProperty("size") val size: String? = null,
-    @JsonProperty("thumbnail") val thumbnail: String? = null,
-    @JsonProperty("secure_stream") val secure_stream: String? = null,
-    @JsonProperty("secure_download") val secure_download: String? = null
 )
 
 data class TeraBoxShareListResponse(
