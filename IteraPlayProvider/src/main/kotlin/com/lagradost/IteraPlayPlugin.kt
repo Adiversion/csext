@@ -14,6 +14,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.*
@@ -90,7 +91,7 @@ class IteraPlayPlugin : Plugin() {
             val worker = TeraBoxExtractor.getSavedCustomWorker(act)
             when {
                 !ndus.isNullOrBlank() -> {
-                    statusView.text = "Status: 🟢 Direct Native TeraBox Active\n(Highest speed 1080p, bypasses all 3rd-party sites)"
+                    statusView.text = "Status: 🟢 Direct Native TeraBox Active [ndus: ${ndus.take(6)}...]\n(Highest speed 1080p, bypasses all 3rd-party sites)"
                     statusView.setTextColor(Color.parseColor("#4CAF50"))
                 }
                 !worker.isNullOrBlank() -> {
@@ -208,6 +209,8 @@ class IteraPlayPlugin : Plugin() {
                     cookieManager.removeAllCookies(null)
                     cookieManager.flush()
                 }
+                ndusInput.setText("")
+                workerInput.setText("")
                 updateStatusDisplay()
                 Toast.makeText(act, "Cleared TeraBox session. Reverted to free engines.", Toast.LENGTH_SHORT).show()
             }
@@ -220,38 +223,30 @@ class IteraPlayPlugin : Plugin() {
         val rootLayout = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(Color.parseColor("#0F172A"))
         }
 
         // Top Action Bar
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(24, 20, 24, 20)
-            setBackgroundColor(Color.parseColor("#1565C0"))
+            setPadding(28, 20, 28, 20)
+            setBackgroundColor(Color.parseColor("#1E293B"))
             gravity = Gravity.CENTER_VERTICAL
         }
 
         val titleView = TextView(activity).apply {
-            text = "TeraBox Login (Auto-Captures Session)"
+            text = "🌐 TeraBox Desktop Login"
             setTextColor(Color.WHITE)
-            textSize = 15f
+            textSize = 15.5f
             setTypeface(null, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         topBar.addView(titleView)
 
-        val captureBtn = Button(activity).apply {
-            text = "✔ Done"
-            setTextColor(Color.parseColor("#4CAF50"))
-            textSize = 14f
-            setTypeface(null, Typeface.BOLD)
-            setBackgroundColor(Color.TRANSPARENT)
-        }
-        topBar.addView(captureBtn)
-
         val closeBtn = Button(activity).apply {
-            text = "✕"
-            setTextColor(Color.WHITE)
-            textSize = 18f
+            text = "✕ Close"
+            setTextColor(Color.parseColor("#CBD5E1"))
+            textSize = 13.5f
             setBackgroundColor(Color.TRANSPARENT)
             setOnClickListener { dialog.dismiss() }
         }
@@ -261,7 +256,8 @@ class IteraPlayPlugin : Plugin() {
 
         // Progress bar
         val progressBar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-            isIndeterminate = true
+            isIndeterminate = false
+            max = 100
             visibility = View.VISIBLE
         }
         rootLayout.addView(progressBar)
@@ -286,7 +282,11 @@ class IteraPlayPlugin : Plugin() {
         fun checkCookies(manualClick: Boolean = false) {
             if (captured) return
 
-            // 1. Scan CookieManager across all 12 candidate domains & active webView.url
+            runCatching {
+                CookieManager.getInstance().flush()
+            }
+
+            // 1. Scan CookieManager across candidate domains and webView.url
             val tokenFromCm = TeraBoxExtractor.scanCookieManagerForNdus(webView.url)
             if (!tokenFromCm.isNullOrBlank()) {
                 onSuccessCaptured(tokenFromCm)
@@ -338,24 +338,54 @@ class IteraPlayPlugin : Plugin() {
                 } else if (manualClick) {
                     val currentUrl = webView.url ?: ""
                     if (currentUrl.contains("/main") || currentUrl.contains("/sharing") || currentUrl.contains("category=all")) {
-                        Toast.makeText(activity, "Logged in! Retrying session capture...", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(activity, "Session detected! Retrying capture...", Toast.LENGTH_SHORT).show()
                         handler.postDelayed({ checkCookies(manualClick = false) }, 1500)
                     } else {
-                        Toast.makeText(activity, "⚠️ No active session found. Please enter credentials and log in.", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(
+                            activity,
+                            "⚠️ Please log in to TeraBox first! (ndus session cookie not found yet)",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
                 }
             }
         }
 
-        captureBtn.setOnClickListener {
-            checkCookies(manualClick = true)
+        // Bottom Action Bar
+        val bottomBar = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(28, 16, 28, 20)
+            setBackgroundColor(Color.parseColor("#1E293B"))
+            gravity = Gravity.CENTER
         }
+
+        val hintView = TextView(activity).apply {
+            text = "Log in via Google, Email, or QR Code above, then tap:"
+            setTextColor(Color.parseColor("#94A3B8"))
+            textSize = 12f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 8)
+        }
+        bottomBar.addView(hintView)
+
+        val saveSessionBtn = Button(activity).apply {
+            text = "💾 Save Session & Connect Native"
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#2563EB"))
+            setPadding(24, 20, 24, 20)
+            setOnClickListener {
+                checkCookies(manualClick = true)
+            }
+        }
+        bottomBar.addView(saveSessionBtn)
 
         val pollRunnable = object : Runnable {
             override fun run() {
                 if (!captured && dialog.isShowing) {
                     checkCookies(manualClick = false)
-                    handler.postDelayed(this, 1200)
+                    handler.postDelayed(this, 1500)
                 }
             }
         }
@@ -366,6 +396,10 @@ class IteraPlayPlugin : Plugin() {
             databaseEnabled = true
             useWideViewPort = true
             loadWithOverviewMode = true
+            setSupportZoom(true)
+            builtInZoomControls = true
+            displayZoomControls = false
+            javaScriptCanOpenWindowsAutomatically = true
             userAgentString = TeraBoxExtractor.USER_AGENT
         }
 
@@ -373,22 +407,41 @@ class IteraPlayPlugin : Plugin() {
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(webView, true)
 
+        fun injectDesktopScript(wv: WebView) {
+            val js = """
+                (function() {
+                    try {
+                        window.open = function(u) { if (u) window.location.href = u; return window; };
+                        if (Object.defineProperty) {
+                            Object.defineProperty(navigator, 'platform', { get: function() { return 'Win32'; } });
+                        }
+                    } catch(e) {}
+                })();
+            """.trimIndent()
+            wv.evaluateJavascript(js, null)
+        }
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                if (newProgress >= 100) {
+                    progressBar.visibility = View.GONE
+                } else {
+                    progressBar.visibility = View.VISIBLE
+                    progressBar.progress = newProgress
+                }
+            }
+        }
+
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 progressBar.visibility = View.VISIBLE
-                webView.evaluateJavascript(
-                    "window.open = function(u) { if (u) window.location.href = u; return window; };",
-                    null
-                )
+                injectDesktopScript(webView)
                 checkCookies(manualClick = false)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 progressBar.visibility = View.GONE
-                webView.evaluateJavascript(
-                    "window.open = function(u) { if (u) window.location.href = u; return window; };",
-                    null
-                )
+                injectDesktopScript(webView)
                 checkCookies(manualClick = false)
             }
         }
@@ -400,9 +453,10 @@ class IteraPlayPlugin : Plugin() {
         }
 
         webView.loadUrl("https://www.1024terabox.com/login")
-        handler.postDelayed(pollRunnable, 1500)
+        handler.postDelayed(pollRunnable, 2000)
 
         rootLayout.addView(webView)
+        rootLayout.addView(bottomBar)
         dialog.setContentView(rootLayout)
         dialog.show()
     }

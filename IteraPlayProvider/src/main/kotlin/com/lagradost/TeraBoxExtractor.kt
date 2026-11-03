@@ -14,7 +14,7 @@ open class TeraBoxExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+        const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         private const val PREFS_NAME = "terabox_prefs"
         private const val KEY_NDUS = "terabox_ndus_cookie"
         private const val KEY_CUSTOM_WORKER = "custom_worker_url"
@@ -34,7 +34,12 @@ open class TeraBoxExtractor : ExtractorApi() {
             "https://www.freeterabox.com",
             "https://freeterabox.com",
             "https://www.teraboxlink.com",
-            "https://teraboxlink.com"
+            "https://teraboxlink.com",
+            "https://passport.terabox.com",
+            "https://passport.1024terabox.com",
+            "https://pan.terabox.com",
+            "https://pan.1024terabox.com",
+            "https://accounts.google.com"
         )
 
         fun extractNdus(raw: String?): String? {
@@ -47,6 +52,7 @@ open class TeraBoxExtractor : ExtractorApi() {
         fun scanCookieManagerForNdus(extraUrl: String? = null): String? {
             return runCatching {
                 val cm = android.webkit.CookieManager.getInstance()
+                runCatching { cm.flush() }
                 val targets = mutableListOf<String>()
                 if (!extraUrl.isNullOrBlank()) {
                     targets.add(extraUrl)
