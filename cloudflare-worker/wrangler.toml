@@ -1,7 +1,0 @@
-name = "terabox-gateway"
-main = "worker.js"
-compatibility_date = "2024-05-01"
-account_id = "7514f6b0eafadace5bbdea45afcab7b9"
-
-[vars]
-NDUS_COOKIE = ""
