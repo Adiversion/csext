@@ -7,6 +7,10 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import java.net.URLEncoder
 
 class IteraPlayProvider : MainAPI() {
@@ -357,6 +361,19 @@ class IteraPlayProvider : MainAPI() {
         return Interceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
+            if (url.contains("virtual_master_")) {
+                val master = TeraBoxExtractor.getMasterPlaylist(url)
+                if (master != null) {
+                    return@Interceptor Response.Builder()
+                        .request(request)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(master.toResponseBody("application/vnd.apple.mpegurl".toMediaTypeOrNull()))
+                        .addHeader("Content-Type", "application/vnd.apple.mpegurl")
+                        .build()
+                }
+            }
             if (url.contains("terabox") || url.contains("1024tera") || extractorLink.source.contains("TeraBox")) {
                 val reqBuilder = request.newBuilder()
                 reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
@@ -367,7 +384,7 @@ class IteraPlayProvider : MainAPI() {
                     reqBuilder.header("Cookie", "ndus=$ndus")
                 }
                 chain.proceed(reqBuilder.build())
-            } else if (url.contains("cdniteraplay") || url.contains("iteraplay")) {
+            } else if (url.contains("cdniteraplay") || url.contains("iteraplay") || extractorLink.source.contains("iTeraPlay")) {
                 val reqBuilder = request.newBuilder()
                 reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
                 reqBuilder.header("Referer", "https://iteraplay.in/")
