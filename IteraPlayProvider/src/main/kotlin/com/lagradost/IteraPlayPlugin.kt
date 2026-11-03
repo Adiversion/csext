@@ -99,7 +99,7 @@ class IteraPlayPlugin : Plugin() {
                     statusView.setTextColor(Color.parseColor("#2196F3"))
                 }
                 else -> {
-                    statusView.text = "Status: ⚪ Free Dual Upstream Active\n(iTeraPlay.in + TeraVideo concurrent engines)"
+                    statusView.text = "Status: ⚪ Free Upstream Active\n(iTeraPlay.in Multi-Quality 1080p Engine)"
                     statusView.setTextColor(Color.parseColor("#B0BEC5"))
                 }
             }

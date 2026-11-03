@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import okhttp3.Interceptor
 import java.net.URLEncoder
 
 class IteraPlayProvider : MainAPI() {
@@ -346,6 +347,33 @@ class IteraPlayProvider : MainAPI() {
                 "720p"  -> SearchQuality.HD
                 "480p"  -> SearchQuality.SD
                 else    -> null
+            }
+        }
+    }
+
+    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
+        val ndus = TeraBoxExtractor.getSavedNdus()
+        return Interceptor { chain ->
+            val request = chain.request()
+            val url = request.url.toString()
+            if (url.contains("terabox") || url.contains("1024tera") || extractorLink.source.contains("TeraBox")) {
+                val reqBuilder = request.newBuilder()
+                reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
+                reqBuilder.header("Referer", "https://www.1024terabox.com/")
+                reqBuilder.header("Accept", "*/*")
+                reqBuilder.header("Connection", "keep-alive")
+                if (!ndus.isNullOrBlank()) {
+                    reqBuilder.header("Cookie", "ndus=$ndus")
+                }
+                chain.proceed(reqBuilder.build())
+            } else if (url.contains("cdniteraplay") || url.contains("iteraplay")) {
+                val reqBuilder = request.newBuilder()
+                reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
+                reqBuilder.header("Referer", "https://iteraplay.in/")
+                reqBuilder.header("Origin", "https://iteraplay.in")
+                chain.proceed(reqBuilder.build())
+            } else {
+                chain.proceed(request)
             }
         }
     }
