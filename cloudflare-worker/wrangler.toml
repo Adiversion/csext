@@ -1,0 +1,8 @@
+name = "terabox-gateway"
+main = "worker.js"
+compatibility_date = "2024-05-01"
+
+# Set environment variables (Optionally configure your private NDUS cookie)
+# You can also set this securely via: npx wrangler secret put NDUS_COOKIE
+[vars]
+NDUS_COOKIE = ""
