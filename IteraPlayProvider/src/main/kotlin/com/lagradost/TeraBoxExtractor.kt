@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import java.net.URLDecoder
 import java.net.URLEncoder
 
 open class TeraBoxExtractor : ExtractorApi() {
@@ -29,6 +30,8 @@ open class TeraBoxExtractor : ExtractorApi() {
             "https://terabox.app",
             "https://www.terabox.com",
             "https://terabox.com",
+            "https://dm.terabox.com",
+            "https://dm.1024tera.com",
             "https://www.1024tera.com",
             "https://1024tera.com",
             "https://www.freeterabox.com",
@@ -328,55 +331,103 @@ open class TeraBoxExtractor : ExtractorApi() {
     ): Boolean {
         return runCatching {
             val surl = extractSurl(rawUrl) ?: return false
-            val hosts = listOf("www.1024terabox.com", "www.terabox.app", "www.terabox.com")
-            var fileList: List<TeraBoxFileInfo>? = null
-            var usedHost = "www.1024terabox.com"
+            val candidateHosts = listOf("dm.terabox.com", "1024tera.com", "www.1024terabox.com", "www.terabox.app", "www.terabox.com")
+            
+            var jsToken: String? = null
+            var usedHost = "dm.terabox.com"
 
-            for (host in hosts) {
-                val listUrl = "https://$host/share/list?app_id=250528&shorturl=$surl&root=1"
+            for (host in candidateHosts) {
+                val wapUrl = "https://$host/wap/share/filelist?surl=$surl"
                 val headers = mapOf(
                     "User-Agent" to USER_AGENT,
                     "Cookie" to "ndus=$ndus",
                     "Referer" to "https://$host/sharing/link?surl=$surl"
                 )
-                val res = runCatching {
-                    app.get(listUrl, headers = headers, timeout = 8).parsedSafe<TeraBoxShareListResponse>()
-                }.getOrNull()
-                val list = res?.list
-                if (!list.isNullOrEmpty()) {
-                    fileList = list
+                val html = runCatching {
+                    app.get(wapUrl, headers = headers, timeout = 10).text
+                }.getOrNull() ?: continue
+
+                // 1. Extract dynamic jsToken from WAP eval decodeURIComponent
+                val evalMatch = Regex("""try\s*\{eval\(decodeURIComponent\([`"']([^`"']+)`\)""").find(html)
+                if (evalMatch != null) {
+                    val decoded = runCatching { URLDecoder.decode(evalMatch.groupValues[1], "UTF-8") }.getOrNull()
+                    if (decoded != null) {
+                        val tm = Regex("""fn\([`"']([a-zA-Z0-9_\-]+)[`"']\)""").find(decoded)
+                            ?: Regex("""jsToken\s*=\s*[`"']([a-zA-Z0-9_\-]+)[`"']""").find(decoded)
+                        jsToken = tm?.groupValues?.get(1)
+                    }
+                }
+                // 2. Direct regex token fallback
+                if (jsToken.isNullOrBlank()) {
+                    val direct = Regex("""%22([A-F0-9]{64,128})%22""", RegexOption.IGNORE_CASE).find(html)
+                        ?: Regex("""jsToken["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
+                    jsToken = direct?.groupValues?.get(1)
+                }
+
+                if (!jsToken.isNullOrBlank()) {
                     usedHost = host
                     break
                 }
             }
 
-            if (fileList.isNullOrEmpty()) return false
+            val tokenParam = if (!jsToken.isNullOrBlank()) "&jsToken=$jsToken" else ""
+            val rootUrl = "https://$usedHost/share/list?app_id=250528${tokenParam}&shorturl=$surl&root=1"
+            val headers = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Cookie" to "ndus=$ndus",
+                "Referer" to "https://$usedHost/wap/share/filelist?surl=$surl"
+            )
 
-            val videoFiles = fileList.filter { item ->
-                val name = item.serverFilename?.lowercase() ?: ""
-                !item.dlink.isNullOrBlank() && (
-                    name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".webm") ||
-                    name.endsWith(".mov") || name.endsWith(".avi") || name.endsWith(".m4v") ||
-                    name.endsWith(".3gp") || !name.contains(".")
-                )
+            val rootRes = runCatching {
+                app.get(rootUrl, headers = headers, timeout = 10).parsedSafe<TeraBoxShareListResponse>()
+            }.getOrNull()
+
+            val initialList = rootRes?.list
+            if (initialList.isNullOrEmpty()) return false
+
+            val queue = ArrayDeque<TeraBoxFileInfo>()
+            queue.addAll(initialList)
+            val foundVideos = mutableListOf<TeraBoxFileInfo>()
+            var folderDepth = 0
+
+            // Recursive folder traversal to extract video files from multi-file shares or subdirectories
+            while (queue.isNotEmpty() && folderDepth < 10) {
+                val item = queue.removeFirst()
+                val isDir = item.isdir?.toString() == "1"
+                if (isDir && !item.path.isNullOrBlank()) {
+                    folderDepth++
+                    val dirParam = URLEncoder.encode(item.path, "UTF-8")
+                    val subUrl = "https://$usedHost/share/list?app_id=250528${tokenParam}&shorturl=$surl&root=0&dir=$dirParam"
+                    val subRes = runCatching {
+                        app.get(subUrl, headers = headers, timeout = 10).parsedSafe<TeraBoxShareListResponse>()
+                    }.getOrNull()
+                    val subList = subRes?.list
+                    if (!subList.isNullOrEmpty()) {
+                        queue.addAll(subList)
+                    }
+                } else if (!item.dlink.isNullOrBlank()) {
+                    val name = item.serverFilename?.lowercase() ?: ""
+                    val isVideo = name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".webm") ||
+                            name.endsWith(".mov") || name.endsWith(".avi") || name.endsWith(".m4v") ||
+                            name.endsWith(".3gp") || (item.size ?: 0L) > 1_000_000L
+                    if (isVideo) {
+                        foundVideos.add(item)
+                    }
+                }
             }
 
-            val targets = if (videoFiles.isNotEmpty()) videoFiles else fileList.filter { !it.dlink.isNullOrBlank() }
             var found = false
-
-            for (file in targets) {
+            for (file in foundVideos) {
                 val dlink = file.dlink ?: continue
                 if (dlink.startsWith("http")) {
                     val name = file.serverFilename?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
-                    val headersMap = mutableMapOf(
+                    val headersMap = mapOf(
                         "User-Agent" to USER_AGENT,
-                        "Referer" to "https://$usedHost/",
+                        "Referer" to "https://www.1024terabox.com/",
+                        "Cookie" to "ndus=$ndus",
                         "Accept" to "*/*",
                         "Connection" to "keep-alive"
                     )
-                    if (ndus.isNotBlank()) {
-                        headersMap["Cookie"] = "ndus=$ndus"
-                    }
                     callback(
                         newExtractorLink(
                             source = "$name Direct",
@@ -384,7 +435,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                             url = dlink,
                             type = ExtractorLinkType.VIDEO
                         ) {
-                            this.referer = "https://$usedHost/"
+                            this.referer = "https://www.1024terabox.com/"
                             this.headers = headersMap
                             this.quality = Qualities.P1080.value
                         }
@@ -440,7 +491,9 @@ data class TeraBoxShareListResponse(
 
 data class TeraBoxFileInfo(
     @JsonProperty("server_filename") val serverFilename: String? = null,
-    @JsonProperty("fs_id") val fsId: String? = null,
+    @JsonProperty("fs_id") val fsId: Any? = null,
     @JsonProperty("dlink") val dlink: String? = null,
-    @JsonProperty("size") val size: Long? = null
+    @JsonProperty("size") val size: Long? = null,
+    @JsonProperty("isdir") val isdir: Any? = null,
+    @JsonProperty("path") val path: String? = null
 )
