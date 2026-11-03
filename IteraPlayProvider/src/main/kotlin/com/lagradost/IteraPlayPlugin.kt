@@ -160,7 +160,8 @@ class IteraPlayPlugin : Plugin() {
             hint = "e.g. https://my-terabox-worker.dev"
             setText(currentWorker ?: "")
             textSize = 12.5f
-            singleLine = true
+            maxLines = 1
+            setSingleLine(true)
         }
         container.addView(workerInput)
 
