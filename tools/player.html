@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Cloudflare Worker TeraBox Stream Test</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; align-items: center; padding: 2rem; }
+    video { width: 100%; max-width: 800px; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); background: #000; }
+    .badge { background: #3b82f6; color: white; padding: 4px 10px; border-radius: 4px; font-size: 13px; font-weight: bold; margin-bottom: 12px; }
+    .status { margin-top: 10px; font-family: monospace; font-size: 14px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="badge">PROXIED VIA CLOUDFLARE WORKER</div>
+  <h2>TeraBox HLS Stream via Worker Middleman</h2>
+  <video id="video" controls autoplay muted></video>
+  <div class="status" id="status">Initializing player...</div>
+
+  <script>
+    const video = document.getElementById('video');
+    const status = document.getElementById('status');
+    const m3u8Content = "#EXTM3U\n#EXT-X-TARGETDURATION:15\n#EXT-X-DISCONTINUITY\n#EXTINF:10,\nhttps://terabox-gateway.terabox-gateway-worker.workers.dev/proxy?url=https%3A%2F%2Fv4.freeterabox.com%2Fvideo%2Fnetdisk-videotran-tky%2F7b30f14f754b8b02ed023bbb7e73d920_1190_24_ts%2Fc36ce9ee24b039ad795040a43483dd7c%3Fts_size%3D7482212%26region%3Dtky%26ccn%3DIN%26from_type%3D1%26fsid%3D801687144894288%26iv%3D0%26ouk%3D4402320101784%26sta_cs%3D56%26to%3Dany%26vuk%3D%26app_id%3D250528%26dp-logid%3D202024905460296789%26fn%3DSchool%2Bboy%2Bwith%2Btution%2Bteacher.mp4%26hit_sl%3D0%26logid%3D202024905460296789%26r%3D197666058%26raw_appid%3D0%26ref%3D0%26size%3D768963806%26sta_dt%3Dvideo%26sta_dx%3D733%26start_ply%3D0%26time%3D1793748005%26tot%3DctqJT%26ts_sl%3D0%26uo%3Dany%26uva%3D2272513262%26csl%3D0%26dtime%3D10%26etag%3Dc36ce9ee24b039ad795040a43483dd7c%26fid%3D15106e53b8a694c82938f9bdf66b4758-%26len%3D303808%26range%3D2580676-2884483%26resv4%3D%26sign%3DBOUTHNFRQ-F3530edecde9cd71b79378b290804a96-FmHPbsgbQaY6w6xRY5QLN5iuCbc%25253D%26xcode%3Dca9f813452e2146f06e1b269ec1cc0b5ea51022bd1beefb0b49835a16ec4e29e3e2500c048b27467f79cfe40785dac96%26xv%3D6%26ogr%3D0%26rrg%3DXVVi%26need_suf%3D%26pmk%3D1400c36ce9ee24b039ad795040a43483dd7cba85afa5000000722b64%26by%3Dmy-streaming\n#EXTINF:10,\nhttps://terabox-gateway.terabox-gateway-worker.workers.dev/proxy?url=https%3A%2F%2Fv4.freeterabox.com%2Fvideo%2Fnetdisk-videotran-tky%2F7b30f14f754b8b02ed023bbb7e73d920_1190_24_ts%2Fc36ce9ee24b039ad795040a43483dd7c%3Fts_size%3D7482212%26region%3Dtky%26ccn%3DIN%26from_type%3D1%26fsid%3D801687144894288%26iv%3D0%26ouk%3D4402320101784%26sta_cs%3D56%26to%3Dany%26vuk%3D%26app_id%3D250528%26dp-logid%3D202024905460296789%26fn%3DSchool%2Bboy%2Bwith%2Btution%2Bteacher.mp4%26hit_sl%3D0%26logid%3D202024905460296789%26r%3D197666058%26raw_appid%3D0%26ref%3D0%26size%3D768963806%26sta_dt%3Dvideo%26sta_dx%3D733%26start_ply%3D0%26time%3D1793748005%26tot%3DctqJT%26ts_sl%3D0%26uo%3Dany%26uva%3D2272513262%26csl%3D0%26dtime%3D10%26etag%3Dc36ce9ee24b039ad795040a43483dd7c%26fid%3D15106e53b8a694c82938f9bdf66b4758-%26len%3D299860%26range%3D2884484-3184343%26resv4%3D%26sign%3DBOUTHNFRQ-F3530edecde9cd71b79378b290804a96-FmHPbsgbQaY6w6xRY5QLN5iuCbc%25253D%26xcode%3Dca9f813452e2146f06e1b269ec1cc0b5ea51022bd1beefb0b49835a16ec4e29e3e2500c048b27467f79cfe40785dac96%26xv%3D6%26ogr%3D0%26rrg%3DXVVi%26need_suf%3D%26pmk%3D1400c36ce9ee24b039ad795040a43483dd7cba85afa5000000722b64%26by%3Dmy-streaming\n#EXTINF:10,\nhttps://terabox-gateway.terabox-gateway-worker.workers.dev/proxy?url=https%3A%2F%2Fv4.freeterabox.com%2Fvideo%2Fnetdisk-videotran-tky%2F7b30f14f754b8b02ed023bbb7e73d920_1190_24_ts%2Fc36ce9ee24b039ad795040a43483dd7c%3Fts_size%3D7482212%26region%3Dtky%26ccn%3DIN%26from_type%3D1%26fsid%3D801687144894288%26iv%3D0%26ouk%3D4402320101784%26sta_cs%3D56%26to%3Dany%26vuk%3D%26app_id%3D250528%26dp-logid%3D202024905460296789%26fn%3DSchool%2Bboy%2Bwith%2Btution%2Bteacher.mp4%26hit_sl%3D0%26logid%3D202024905460296789%26r%3D197666058%26raw_appid%3D0%26ref%3D0%26size%3D768963806%26sta_dt%3Dvideo%26sta_dx%3D733%26start_ply%3D0%26time%3D1793748005%26tot%3DctqJT%26ts_sl%3D0%26uo%3Dany%26uva%3D2272513262%26csl%3D0%26dtime%3D10%26etag%3Dc36ce9ee24b039ad795040a43483dd7c%26fid%3D15106e53b8a694c82938f9bdf66b4758-%26len%3D299108%26range%3D3184344-3483451%26resv4%3D%26sign%3DBOUTHNFRQ-F3530edecde9cd71b79378b290804a96-FmHPbsgbQaY6w6xRY5QLN5iuCbc%25253D%26xcode%3Dca9f813452e2146f06e1b269ec1cc0b5ea51022bd1beefb0b49835a16ec4e29e3e2500c048b27467f79cfe40785dac96%26xv%3D6%26ogr%3D0%26rrg%3DXVVi%26need_suf%3D%26pmk%3D1400c36ce9ee24b039ad795040a43483dd7cba85afa5000000722b64%26by%3Dmy-streaming\n#EXT-X-ENDLIST\n";
+    const blob = new Blob([m3u8Content], { type: 'application/vnd.apple.mpegurl' });
+    const blobUrl = URL.createObjectURL(blob);
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({ enableWorker: true });
+      hls.loadSource(blobUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        status.innerText = "Manifest parsed! Playing video chunks through worker...";
+        video.play().catch(e => { status.innerText = "Click play on video"; });
+      });
+      hls.on(Hls.Events.FRAG_LOADED, (e, data) => {
+        status.innerText = "Chunk #" + data.frag.sn + " loaded (" + Math.round(data.frag.loaded / 1024) + " KB) via Cloudflare Worker proxy";
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = blobUrl;
+    }
+  </script>
+</body>
+</html>
