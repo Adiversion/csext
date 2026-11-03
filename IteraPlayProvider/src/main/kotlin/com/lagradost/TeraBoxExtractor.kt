@@ -159,26 +159,31 @@ open class TeraBoxExtractor : ExtractorApi() {
     ) {
         val cleanUrl = url.trim()
         val ndus = getSavedNdus()
-
-        // 1. Direct Native TeraBox Engine (Highest priority, 100% direct official streaming with 0 third-party dependency):
-        if (!ndus.isNullOrBlank()) {
-            val resolvedDirect = resolveDirectTeraBox(cleanUrl, ndus, callback)
-            if (resolvedDirect) return
-        }
-
-        // 2. Custom Gateway / Self-Hosted Worker Engine (0 third-party dependency):
         val customWorker = getSavedCustomWorker()
-        if (!customWorker.isNullOrBlank()) {
-            val resolvedCustom = resolveViaCustomWorker(cleanUrl, customWorker, callback)
-            if (resolvedCustom) return
-        }
 
-        // 3. Parallel Redundant Native Engines (Zero Login, Zero Captcha):
-        // Run both iTeraPlay.in and TeraVideo resolvers concurrently so all stream qualities are available
-        // and playback NEVER fails if any single upstream server or worker experiences downtime.
+        // Run ALL enabled resolvers concurrently in parallel:
+        // No resolver blocks any other resolver. Fast resolvers (TeraVideo ~1s) emit links instantly.
+        // High-definition multi-quality resolvers (iTeraPlay.in) emit true 1080p/720p HLS & MP4.
+        // Direct TeraBox (with ndus) emits official 1080p direct links.
         coroutineScope {
-            val jobIn = async { resolveViaIteraPlayIn(cleanUrl, callback) }
-            val jobTv = async { resolveViaTeraVideo(cleanUrl, callback) }
+            val jobDirect = if (!ndus.isNullOrBlank()) async {
+                resolveDirectTeraBox(cleanUrl, ndus, callback)
+            } else null
+
+            val jobWorker = if (!customWorker.isNullOrBlank()) async {
+                resolveViaCustomWorker(cleanUrl, customWorker, callback)
+            } else null
+
+            val jobIn = async {
+                resolveViaIteraPlayIn(cleanUrl, callback)
+            }
+
+            val jobTv = async {
+                resolveViaTeraVideo(cleanUrl, callback)
+            }
+
+            jobDirect?.await()
+            jobWorker?.await()
             jobIn.await()
             jobTv.await()
         }
@@ -203,7 +208,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                 target,
                 headers = headers,
                 json = mapOf("url" to fullTeraBoxUrl),
-                timeout = 15
+                timeout = 35
             ).parsedSafe<IteraPlayInImportResponse>()
 
             val videos = res?.videos
@@ -213,7 +218,13 @@ open class TeraBoxExtractor : ExtractorApi() {
                     val title = video.title?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
                     val fastStreams = video.fastStreamUrl
                     if (fastStreams != null && fastStreams.isNotEmpty()) {
-                        for ((qName, hlsUrl) in fastStreams) {
+                        val orderedKeys = listOf("1080p", "720p", "480p", "360p")
+                        val sortedEntries = fastStreams.entries.sortedBy { entry ->
+                            val idx = orderedKeys.indexOf(entry.key.lowercase())
+                            if (idx != -1) idx else 99
+                        }
+
+                        for ((qName, hlsUrl) in sortedEntries) {
                             if (hlsUrl.isBlank()) continue
                             val q = when (qName.lowercase()) {
                                 "1080p" -> Qualities.P1080.value
@@ -242,7 +253,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                         callback(
                             newExtractorLink(
                                 source = "iTeraPlay Direct",
-                                name = "$title - [Direct MP4 ⚡]",
+                                name = "$title - [1080p Direct MP4 ⚡]",
                                 url = streamUrl,
                                 type = ExtractorLinkType.VIDEO
                             ) {
@@ -291,8 +302,8 @@ open class TeraBoxExtractor : ExtractorApi() {
     ): Boolean {
         return runCatching {
             val surl = extractSurl(rawUrl) ?: return false
-            val hosts = listOf("www.1024terabox.com", "www.terabox.app", "www.1024tera.com")
-            var file: TeraBoxFileInfo? = null
+            val hosts = listOf("www.1024terabox.com", "www.terabox.app")
+            var fileList: List<TeraBoxFileInfo>? = null
             var usedHost = "www.1024terabox.com"
 
             for (host in hosts) {
@@ -303,35 +314,49 @@ open class TeraBoxExtractor : ExtractorApi() {
                     "Referer" to "https://$host/sharing/link?surl=$surl"
                 )
                 val res = runCatching {
-                    app.get(listUrl, headers = headers, timeout = 8).parsedSafe<TeraBoxShareListResponse>()
+                    app.get(listUrl, headers = headers, timeout = 6).parsedSafe<TeraBoxShareListResponse>()
                 }.getOrNull()
-                val f = res?.list?.firstOrNull()
-                if (f != null && !f.dlink.isNullOrBlank()) {
-                    file = f
+                val list = res?.list
+                if (!list.isNullOrEmpty()) {
+                    fileList = list
                     usedHost = host
                     break
                 }
             }
 
-            if (file == null) return false
-            val dlink = file.dlink ?: return false
+            if (fileList.isNullOrEmpty()) return false
 
-            if (dlink.startsWith("http")) {
-                callback(
-                    newExtractorLink(
-                        source = "$name Direct",
-                        name = "${file.serverFilename ?: "TeraBox Video"} - [Direct 🚀]",
-                        url = dlink,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = "https://$usedHost/"
-                        this.quality = Qualities.P1080.value
-                    }
+            val videoFiles = fileList.filter { item ->
+                val name = item.serverFilename?.lowercase() ?: ""
+                !item.dlink.isNullOrBlank() && (
+                    name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".webm") ||
+                    name.endsWith(".mov") || name.endsWith(".avi") || name.endsWith(".m4v") ||
+                    name.endsWith(".3gp") || !name.contains(".")
                 )
-                true
-            } else {
-                false
             }
+
+            val targets = if (videoFiles.isNotEmpty()) videoFiles else fileList.filter { !it.dlink.isNullOrBlank() }
+            var found = false
+
+            for (file in targets) {
+                val dlink = file.dlink ?: continue
+                if (dlink.startsWith("http")) {
+                    val name = file.serverFilename?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
+                    callback(
+                        newExtractorLink(
+                            source = "$name Direct",
+                            name = "$name - [1080p Official 🚀]",
+                            url = dlink,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://$usedHost/"
+                            this.quality = Qualities.P1080.value
+                        }
+                    )
+                    found = true
+                }
+            }
+            found
         }.getOrDefault(false)
     }
 
@@ -350,11 +375,24 @@ open class TeraBoxExtractor : ExtractorApi() {
                 "Referer" to "https://teravideo.in/terabox-player-online/",
                 "Origin" to "https://teravideo.in"
             )
-            val res = app.get(target, headers = headers, timeout = 12).parsedSafe<TeraVideoResponse>()
+            val res = app.get(target, headers = headers, timeout = 10).parsedSafe<TeraVideoResponse>()
             val active = res?.data?.activeFile ?: res?.data?.file
             if (res?.success == true && active != null) {
                 val videoName = active.name ?: res.data?.title ?: "TeraBox Video"
                 var found = false
+
+                val has720 = active.qualities?.any { it.label?.contains("720") == true || it.value == "720p" } == true
+                val has1080 = active.qualities?.any { it.label?.contains("1080") == true || it.value == "1080p" } == true
+                val masterQuality = when {
+                    has1080 -> Qualities.P1080.value
+                    has720  -> Qualities.P720.value
+                    else    -> Qualities.P480.value
+                }
+                val masterLabel = when {
+                    has1080 -> "1080p"
+                    has720  -> "720p"
+                    else    -> "480p"
+                }
 
                 val masterUrl = active.masterUrl
                 if (!masterUrl.isNullOrBlank()) {
@@ -362,12 +400,12 @@ open class TeraBoxExtractor : ExtractorApi() {
                     callback(
                         newExtractorLink(
                             source = "TeraVideo HLS",
-                            name = "$videoName - [TeraVideo Adaptive HLS ⚡]",
+                            name = "$videoName - [TeraVideo $masterLabel Adaptive HLS ⚡]",
                             url = fullMaster,
                             type = ExtractorLinkType.M3U8
                         ) {
                             this.referer = "https://teravideo.in/terabox-player-online/"
-                            this.quality = Qualities.P720.value
+                            this.quality = masterQuality
                         }
                     )
                     found = true
@@ -401,7 +439,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                             type = ExtractorLinkType.VIDEO
                         ) {
                             this.referer = "https://teravideo.in/terabox-player-online/"
-                            this.quality = Qualities.P720.value
+                            this.quality = masterQuality
                         }
                     )
                     found = true
@@ -470,7 +508,14 @@ data class TeraVideoFile(
     @JsonProperty("duration") val duration: Long? = null,
     @JsonProperty("masterUrl") val masterUrl: String? = null,
     @JsonProperty("hlsUrl") val hlsUrl: String? = null,
-    @JsonProperty("streamUrl") val streamUrl: String? = null
+    @JsonProperty("streamUrl") val streamUrl: String? = null,
+    @JsonProperty("qualities") val qualities: List<TeraVideoQualityItem>? = null
+)
+
+data class TeraVideoQualityItem(
+    @JsonProperty("label") val label: String? = null,
+    @JsonProperty("value") val value: String? = null,
+    @JsonProperty("resolution") val resolution: String? = null
 )
 
 data class TeraBoxShareListResponse(
