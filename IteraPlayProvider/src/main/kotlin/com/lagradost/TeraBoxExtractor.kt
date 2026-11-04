@@ -74,9 +74,10 @@ object LocalM3u8Server {
                 val reader = BufferedReader(InputStreamReader(s.getInputStream()))
                 val firstLine = reader.readLine() ?: return
                 // Expected format: GET /master_<id>.m3u8 HTTP/1.1
-                val path = firstLine.split(" ").getOrNull(1) ?: return
-                val id = path.substringAfterLast("/").substringBefore(".m3u8")
-                val content = playlists[id] ?: playlists[path] ?: playlists["master_$id"]
+                val rawPath = firstLine.split(" ").getOrNull(1) ?: return
+                val cleanPath = rawPath.substringBefore("?")
+                val id = cleanPath.substringAfterLast("/").removeSuffix(".m3u8")
+                val content = playlists[cleanPath] ?: playlists[id] ?: playlists["master_$id"] ?: playlists["/master_$id.m3u8"] ?: playlists["$id.m3u8"]
 
                 val out = s.getOutputStream()
                 if (content != null) {
@@ -107,9 +108,18 @@ object LocalM3u8Server {
         return "http://127.0.0.1:$p/master_$id.m3u8"
     }
 
+    fun set(key: String, m3u8Content: String): String {
+        val p = start()
+        val cleanKey = key.removePrefix("/").removeSuffix(".m3u8")
+        playlists[cleanKey] = m3u8Content
+        playlists["/$cleanKey.m3u8"] = m3u8Content
+        playlists["$cleanKey.m3u8"] = m3u8Content
+        return "http://127.0.0.1:$p/$cleanKey.m3u8"
+    }
+
     fun get(key: String): String? {
-        val id = key.substringAfterLast("/").substringBefore(".m3u8")
-        return playlists[key] ?: playlists[id] ?: playlists["master_$id"]
+        val clean = key.substringBefore("?").substringAfterLast("/").removeSuffix(".m3u8")
+        return playlists[key] ?: playlists[clean] ?: playlists["master_$clean"]
     }
 }
 
@@ -375,6 +385,124 @@ open class TeraBoxExtractor : ExtractorApi() {
             }.getOrNull()
         }
 
+        suspend fun resolveFlowVideoPlayer(shareUrl: String): FlowResolvedStream? {
+            return runCatching {
+                val baseUrl = "https://flowvideoplayer.com"
+                val userAgent = USER_AGENT
+
+                val browserHeaders = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language" to "en-US,en;q=0.9",
+                    "Sec-Ch-Ua" to """"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"""",
+                    "Sec-Ch-Ua-Mobile" to "?0",
+                    "Sec-Ch-Ua-Platform" to """"Windows"""",
+                    "Sec-Fetch-Dest" to "document",
+                    "Sec-Fetch-Mode" to "navigate",
+                    "Sec-Fetch-Site" to "none",
+                    "Sec-Fetch-User" to "?1",
+                    "Upgrade-Insecure-Requests" to "1"
+                )
+
+                // 1. GET /
+                val homeRes = app.get(baseUrl, headers = browserHeaders, timeout = 10)
+                val homeHtml = homeRes.text
+                val csrfToken = Regex("""name=["']csrf-token["']\s+content=["']([^"']+)["']""").find(homeHtml)?.groupValues?.get(1)
+                    ?: return@runCatching null
+
+                val homeCookies = homeRes.cookies
+                val initialCookieHeader = homeCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                // 2. POST /device/init
+                val devicePayload = mapOf(
+                    "cpu" to 16,
+                    "memory" to 8,
+                    "touch" to 0,
+                    "platform" to "Win32",
+                    "lang" to "en-US",
+                    "vendor" to "Google Inc.",
+                    "webgl_vendor" to "Google Inc. (NVIDIA)",
+                    "webgl_renderer" to "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                    "ua" to userAgent,
+                    "backup_token" to null,
+                    "os" to "windows",
+                    "browser" to "chrome",
+                    "pwa_installed" to false
+                )
+
+                val initHeaders = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "X-CSRF-TOKEN" to csrfToken,
+                    "Origin" to baseUrl,
+                    "Referer" to "$baseUrl/",
+                    "Sec-Ch-Ua" to """"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"""",
+                    "Sec-Ch-Ua-Mobile" to "?0",
+                    "Sec-Ch-Ua-Platform" to """"Windows"""",
+                    "Sec-Fetch-Dest" to "empty",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "same-origin",
+                    "Cookie" to initialCookieHeader
+                )
+
+                val initRes = app.post(
+                    "$baseUrl/device/init",
+                    headers = initHeaders,
+                    json = devicePayload,
+                    timeout = 10
+                )
+
+                val mergedCookies = mutableMapOf<String, String>()
+                mergedCookies.putAll(homeCookies)
+                mergedCookies.putAll(initRes.cookies)
+                val mergedCookieHeader = mergedCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                // 3. POST /search/video
+                val searchHeaders = initHeaders.toMutableMap()
+                searchHeaders["Accept"] = "application/json, text/plain, */*"
+                searchHeaders["Cookie"] = mergedCookieHeader
+
+                val searchRes = app.post(
+                    "$baseUrl/search/video",
+                    headers = searchHeaders,
+                    json = mapOf("url" to shareUrl),
+                    timeout = 15
+                )
+
+                val searchJson = runCatching { parseJson<FlowSearchResponse>(searchRes.text) }.getOrNull()
+                val firstVid = searchJson?.response?.firstOrNull() ?: return@runCatching null
+
+                // 4. Resolve 302 location from download_url
+                var direct1080Url: String? = null
+                val dlApiUrl = firstVid.downloadUrl
+                if (!dlApiUrl.isNullOrBlank()) {
+                    val dirStep = app.get(
+                        dlApiUrl,
+                        headers = mapOf(
+                            "User-Agent" to userAgent,
+                            "Cookie" to mergedCookieHeader,
+                            "Referer" to "$baseUrl/"
+                        ),
+                        allowRedirects = false,
+                        timeout = 10
+                    )
+                    val loc = dirStep.headers["Location"] ?: dirStep.headers["location"]
+                    if (!loc.isNullOrBlank() && loc.startsWith("http")) {
+                        direct1080Url = loc
+                    }
+                }
+
+                FlowResolvedStream(
+                    fileName = firstVid.fileName,
+                    direct1080Url = direct1080Url,
+                    fast720Url = firstVid.fastStreamUrl,
+                    fileSize = firstVid.fileSize
+                )
+            }.getOrNull()
+        }
+
         suspend fun resolveDirectTeraBox(
             rawUrl: String,
             callback: (ExtractorLink) -> Unit,
@@ -382,128 +510,124 @@ open class TeraBoxExtractor : ExtractorApi() {
             targetPath: String? = null
         ): Boolean {
             return runCatching {
-                val folderResult = fetchShareContents(rawUrl) ?: return false
-                val ndus = getSavedNdus()
-                val usedHost = folderResult.host
-                val surl = folderResult.surl
-                val jsToken = folderResult.jsToken
-                val sign = folderResult.sign
-                val timestamp = folderResult.timestamp
-                val uk = folderResult.uk
-                val shareid = folderResult.shareid
-                val tokenParam = if (!jsToken.isNullOrBlank()) "&jsToken=$jsToken" else ""
+                val surl = extractSurl(rawUrl) ?: return false
+                val streamId = (surl + "_" + (targetFsId ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
 
-                val targetVideo = if (!targetFsId.isNullOrBlank()) {
-                    folderResult.videos.firstOrNull { it.fsId?.toString() == targetFsId }
-                        ?: folderResult.videos.firstOrNull { it.path == targetPath }
-                        ?: folderResult.videos.firstOrNull()
-                } else {
-                    folderResult.videos.firstOrNull()
-                } ?: return false
+                coroutineScope {
+                    val flowDeferred = async { resolveFlowVideoPlayer(rawUrl) }
+                    val nativeDeferred = async { runCatching { fetchShareContents(rawUrl) }.getOrNull() }
 
-                val name = targetVideo.serverFilename?.removeSuffix(".mp4")?.removeSuffix(".mkv")?.replace("_", " ")?.trim() ?: "TeraBox Video"
-                val fid = targetFsId ?: targetVideo.fsId?.toString() ?: return false
-                val path = targetPath ?: targetVideo.path ?: return false
+                    val flowStream = flowDeferred.await()
+                    val folderResult = nativeDeferred.await()
 
-                val shareReferer = "https://$usedHost/sharing/link?surl=$surl"
-                val hlsHeaders = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Referer" to shareReferer,
-                    "Cookie" to "ndus=$ndus"
-                )
+                    val variants = mutableListOf<HlsVariant>()
 
-                if (!sign.isNullOrBlank() && !timestamp.isNullOrBlank() && !uk.isNullOrBlank() && !shareid.isNullOrBlank()) {
-                    val pathEnc = URLEncoder.encode(path, "UTF-8")
+                    // 1. 1080p from Flow Video Player (Unthrottled Worker Stream)
+                    if (flowStream?.direct1080Url != null) {
+                        val v1080M3u8 = """
+                            #EXTM3U
+                            #EXT-X-VERSION:3
+                            #EXT-X-TARGETDURATION:15000
+                            #EXT-X-PLAYLIST-TYPE:VOD
+                            #EXT-X-MEDIA-SEQUENCE:0
+                            #EXTINF:15000.0,
+                            ${flowStream.direct1080Url}
+                            #EXT-X-ENDLIST
+                        """.trimIndent()
+                        val v1080Url = LocalM3u8Server.set("v1080_$streamId", v1080M3u8)
+                        variants.add(HlsVariant("1080p", "1920x1080", 6000000L, v1080Url))
+                    }
 
-                    val resConfigs = listOf(
-                        VariantProbeConfig("1080p", "1920x1080", 5000000L, "M3U8_AUTO_1080", Qualities.P1080.value),
-                        VariantProbeConfig("720p", "1280x720", 2800000L, "M3U8_AUTO_720", Qualities.P720.value),
-                        VariantProbeConfig("480p", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value),
-                        VariantProbeConfig("360p", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value)
-                    )
+                    // 2. 720p from Flow Video Player (Fast Worker HLS Stream)
+                    if (flowStream?.fast720Url != null) {
+                        variants.add(HlsVariant("720p", "1280x720", 3000000L, flowStream.fast720Url))
+                    }
 
-                    val validVariants = coroutineScope {
-                        val jobs = resConfigs.map { cfg ->
-                            async {
-                                val streamUrl = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=${cfg.typeParam}&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
-                                val res = runCatching {
-                                    app.get(streamUrl, headers = hlsHeaders, timeout = 5).text
-                                }.getOrNull()
+                    // 3 & 4. 480p and 360p from Native TeraBox
+                    if (folderResult != null) {
+                        val usedHost = folderResult.host
+                        val jsToken = folderResult.jsToken
+                        val sign = folderResult.sign
+                        val timestamp = folderResult.timestamp
+                        val uk = folderResult.uk
+                        val shareid = folderResult.shareid
+                        val ndus = getSavedNdus()
+                        val tokenParam = if (!jsToken.isNullOrBlank()) "&jsToken=$jsToken" else ""
 
-                                if (res != null && res.contains("#EXTM3U") && !res.contains("\"errno\":130")) {
-                                    HlsVariant(cfg.name, cfg.resolution, cfg.bandwidth, streamUrl)
-                                } else {
-                                    null
+                        val targetVideo = if (!targetFsId.isNullOrBlank()) {
+                            folderResult.videos.firstOrNull { it.fsId?.toString() == targetFsId }
+                                ?: folderResult.videos.firstOrNull { it.path == targetPath }
+                                ?: folderResult.videos.firstOrNull()
+                        } else {
+                            folderResult.videos.firstOrNull()
+                        }
+
+                        val fid = targetFsId ?: targetVideo?.fsId?.toString()
+                        val path = targetPath ?: targetVideo?.path
+
+                        if (!sign.isNullOrBlank() && !timestamp.isNullOrBlank() && !uk.isNullOrBlank() && !shareid.isNullOrBlank() && !fid.isNullOrBlank() && !path.isNullOrBlank()) {
+                            val pathEnc = URLEncoder.encode(path, "UTF-8")
+                            val hlsHeaders = mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to "https://$usedHost/sharing/link?surl=$surl",
+                                "Cookie" to "ndus=$ndus"
+                            )
+
+                            val nativeConfigs = listOf(
+                                VariantProbeConfig("480p", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value),
+                                VariantProbeConfig("360p", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value)
+                            )
+
+                            val nativeJobs = nativeConfigs.map { cfg ->
+                                async {
+                                    val streamUrl = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=${cfg.typeParam}&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
+                                    val res = runCatching {
+                                        app.get(streamUrl, headers = hlsHeaders, timeout = 5).text
+                                    }.getOrNull()
+
+                                    if (res != null && res.contains("#EXTM3U") && !res.contains("\"errno\":130")) {
+                                        HlsVariant(cfg.name, cfg.resolution, cfg.bandwidth, streamUrl)
+                                    } else {
+                                        null
+                                    }
                                 }
                             }
+                            val validNative = nativeJobs.mapNotNull { it.await() }
+                            variants.addAll(validNative)
                         }
-                        jobs.mapNotNull { it.await() }
                     }
 
-                    if (validVariants.isNotEmpty()) {
-                        val sortedVariants = validVariants.sortedByDescending { it.bandwidth }
-                        val masterContent = buildString {
-                            append("#EXTM3U\n")
-                            append("#EXT-X-VERSION:3\n")
-                            append("#EXT-X-INDEPENDENT-SEGMENTS\n")
-                            for (v in sortedVariants) {
-                                append("#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.name}\"\n")
-                                append("${v.url}\n")
-                            }
-                        }
-
-                        val streamId = (surl + "_" + (targetFsId ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
-                        val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
-
-                        callback(
-                            newExtractorLink(
-                                source = "$name Adaptive",
-                                name = "$name - [Adaptive Multi-Quality ⚡ (Unthrottled)]",
-                                url = masterUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = shareReferer
-                                this.headers = hlsHeaders
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        return true
+                    if (variants.isEmpty()) {
+                        return@coroutineScope false
                     }
-                }
 
-                // Direct MP4 fallback for VIP accounts or small files
-                val dlink = targetVideo.dlink
-                if (!dlink.isNullOrBlank() && dlink.startsWith("http")) {
-                    val headersMap = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Referer" to "https://www.1024terabox.com/",
-                        "Cookie" to "ndus=$ndus",
-                        "Accept" to "*/*",
-                        "Connection" to "keep-alive"
-                    )
+                    val sortedVariants = variants.sortedByDescending { it.bandwidth }
+                    val masterContent = buildString {
+                        append("#EXTM3U\n")
+                        append("#EXT-X-VERSION:3\n")
+                        append("#EXT-X-INDEPENDENT-SEGMENTS\n")
+                        for (v in sortedVariants) {
+                            append("#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.name}\"\n")
+                            append("${v.url}\n")
+                        }
+                    }
 
-                    val finalStreamUrl = runCatching {
-                        val step = app.get(dlink, headers = headersMap, allowRedirects = false, timeout = 5)
-                        val loc = step.headers["Location"] ?: step.headers["location"]
-                        if (!loc.isNullOrBlank() && loc.startsWith("http")) loc else dlink
-                    }.getOrDefault(dlink)
+                    val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
 
+                    // Unified single ExtractorLink containing all qualities (1080p, 720p, 480p, 360p)
                     callback(
                         newExtractorLink(
-                            source = "$name Direct",
-                            name = "$name - [Direct MP4 (VIP / Small Files)]",
-                            url = finalStreamUrl,
-                            type = ExtractorLinkType.VIDEO
+                            source = "TeraBox Adaptive",
+                            name = "TeraBox - [Adaptive Multi-Quality ⚡ (1080p/720p/480p/360p)]",
+                            url = masterUrl,
+                            type = ExtractorLinkType.M3U8
                         ) {
                             this.referer = "https://www.1024terabox.com/"
-                            this.headers = headersMap
-                            this.quality = Qualities.P1080.value
+                            this.quality = Qualities.Unknown.value
                         }
                     )
-                    return true
+                    true
                 }
-
-                false
             }.getOrDefault(false)
         }
     }
@@ -515,9 +639,6 @@ open class TeraBoxExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val cleanUrl = url.trim()
-        val ndus = getSavedNdus()
-        if (ndus.isNullOrBlank()) return
-
         runCatching {
             resolveDirectTeraBox(cleanUrl, callback)
         }
@@ -586,4 +707,26 @@ data class TeraBoxFolderResult(
     val jsToken: String?,
     val host: String,
     val surl: String
+)
+
+data class FlowSearchResponse(
+    @JsonProperty("code") val code: Int? = null,
+    @JsonProperty("status") val status: Boolean? = null,
+    @JsonProperty("message") val message: String? = null,
+    @JsonProperty("response") val response: List<FlowVideoItem>? = null
+)
+
+data class FlowVideoItem(
+    @JsonProperty("file_name") val fileName: String? = null,
+    @JsonProperty("download_url") val downloadUrl: String? = null,
+    @JsonProperty("fast_stream_url") val fastStreamUrl: String? = null,
+    @JsonProperty("file_size") val fileSize: String? = null,
+    @JsonProperty("file_size_bytes") val fileSizeBytes: Long? = null
+)
+
+data class FlowResolvedStream(
+    val fileName: String?,
+    val direct1080Url: String?,
+    val fast720Url: String?,
+    val fileSize: String?
 )
