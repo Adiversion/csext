@@ -22,6 +22,7 @@ class IteraPlayProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(
         TvType.Movie,
+        TvType.TvSeries,
         TvType.Others
     )
 
@@ -209,6 +210,39 @@ class IteraPlayProvider : MainAPI() {
             poster = poster
         )
 
+        if (!teraboxUrl.isNullOrBlank()) {
+            val folderRes = runCatching { TeraBoxExtractor.fetchShareContents(teraboxUrl) }.getOrNull()
+            if (folderRes != null && folderRes.videos.size > 1) {
+                val episodes = folderRes.videos.mapIndexed { idx, v ->
+                    val epTitle = v.serverFilename?.removeSuffix(".mp4")?.removeSuffix(".mkv")?.replace("_", " ")?.trim()
+                        ?: "Episode ${idx + 1}"
+                    val epData = IteraLinkData(
+                        videoId = videoId,
+                        teraboxUrl = teraboxUrl,
+                        title = epTitle,
+                        poster = poster,
+                        fsId = v.fsId?.toString(),
+                        filePath = v.path
+                    )
+                    newEpisode(epData.toJson()) {
+                        this.name = epTitle
+                        this.episode = idx + 1
+                        this.posterUrl = poster
+                    }
+                }
+
+                return newTvSeriesLoadResponse(
+                    name = title,
+                    url = url,
+                    type = TvType.TvSeries,
+                    episodes = episodes
+                ) {
+                    this.posterUrl = poster
+                    this.plot = "TeraBox folder containing ${folderRes.videos.size} episodes."
+                }
+            }
+        }
+
         return newMovieLoadResponse(
             name = title,
             url = url,
@@ -277,7 +311,6 @@ class IteraPlayProvider : MainAPI() {
             return false
         }
 
-        // Delegate to registered TeraBox extractors (iTeraPlay.in Multi-HLS/MP4 + TeraVideo Adaptive HLS)
         var foundLinks = false
         val customCallback: (ExtractorLink) -> Unit = { link ->
             foundLinks = true
@@ -285,7 +318,18 @@ class IteraPlayProvider : MainAPI() {
         }
 
         runCatching {
-            loadExtractor(teraboxUrl, subtitleCallback, customCallback)
+            TeraBoxExtractor.resolveDirectTeraBox(
+                teraboxUrl,
+                customCallback,
+                targetFsId = linkData.fsId,
+                targetPath = linkData.filePath
+            )
+        }
+
+        if (!foundLinks) {
+            runCatching {
+                loadExtractor(teraboxUrl, subtitleCallback, customCallback)
+            }
         }
 
         return foundLinks
@@ -428,5 +472,7 @@ data class IteraLinkData(
     val videoId: Long? = null,
     val teraboxUrl: String? = null,
     val title: String? = null,
-    val poster: String? = null
+    val poster: String? = null,
+    val fsId: String? = null,
+    val filePath: String? = null
 )

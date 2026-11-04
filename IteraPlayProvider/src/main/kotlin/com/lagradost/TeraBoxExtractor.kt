@@ -263,57 +263,33 @@ open class TeraBoxExtractor : ExtractorApi() {
             }
             return surl
         }
-    }
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val cleanUrl = url.trim()
-        val ndus = getSavedNdus()
-        if (ndus.isNullOrBlank()) return
+        suspend fun fetchShareContents(shareUrl: String): TeraBoxFolderResult? {
+            return runCatching {
+                val surl = extractSurl(shareUrl) ?: return@runCatching null
+                val ndus = getSavedNdus()
+                val candidateHosts = listOf("dm.terabox.com", "www.1024terabox.com", "1024tera.com", "terabox.app")
 
-        runCatching {
-            resolveDirectTeraBox(cleanUrl, ndus, callback)
-        }
-    }
+                for (host in candidateHosts) {
+                    val sharePageUrl = "https://$host/sharing/link?surl=$surl"
+                    val headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Cookie" to "ndus=$ndus",
+                        "Referer" to sharePageUrl
+                    )
+                    val html = runCatching { app.get(sharePageUrl, headers = headers, timeout = 5).text }.getOrNull()
+                    if (html.isNullOrBlank()) continue
 
-    private suspend fun resolveDirectTeraBox(
-        rawUrl: String,
-        ndus: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        return runCatching {
-            val surl = extractSurl(rawUrl) ?: return false
-            val candidateHosts = listOf("dm.terabox.com", "dm.1024tera.com", "1024tera.com")
-            
-            var jsToken: String? = null
-            var usedHost = "dm.terabox.com"
-            var sign: String? = null
-            var timestamp: String? = null
-            var uk: String? = null
-            var shareid: String? = null
-
-            for (host in candidateHosts) {
-                val sharePageUrl = "https://$host/sharing/link?surl=$surl"
-                val headers = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Cookie" to "ndus=$ndus",
-                    "Referer" to "https://$host/sharing/link?surl=$surl"
-                )
-                val html = runCatching {
-                    app.get(sharePageUrl, headers = headers, timeout = 5).text
-                }.getOrNull()
-
-                if (!html.isNullOrBlank()) {
                     val tokenMatch = Regex("""fn\(['"]([A-F0-9]{64,128})['"]\)""", RegexOption.IGNORE_CASE).find(html)
                         ?: Regex("""%22([A-F0-9]{64,128})%22""", RegexOption.IGNORE_CASE).find(html)
                         ?: Regex("""jsToken["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
-                    if (tokenMatch != null) {
-                        jsToken = tokenMatch.groupValues[1]
-                    }
+                    val jsToken = tokenMatch?.groupValues?.get(1)
+
+                    var sign: String? = null
+                    var timestamp: String? = null
+                    var uk: String? = null
+                    var shareid: String? = null
+                    var initialFile: TeraBoxFileInfo? = null
 
                     val stateIdx = html.indexOf("window.__INITIAL_STATE__")
                     if (stateIdx != -1) {
@@ -329,6 +305,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                                     timestamp = shareInfo.timestamp?.toString()?.takeIf { it.isNotBlank() }
                                     uk = shareInfo.uk?.toString()?.takeIf { it.isNotBlank() }
                                     shareid = shareInfo.shareid?.toString()?.takeIf { it.isNotBlank() }
+                                    initialFile = shareInfo.fileInfo
                                 }
                             }
                         }
@@ -347,144 +324,203 @@ open class TeraBoxExtractor : ExtractorApi() {
                         shareid = Regex(""""shareid"\s*:\s*"?(\d+)""""").find(html)?.groupValues?.get(1)
                     }
 
-                    if (!sign.isNullOrBlank() || !jsToken.isNullOrBlank()) {
-                        usedHost = host
-                        break
+                    if (sign.isNullOrBlank() && jsToken.isNullOrBlank()) continue
+
+                    val tokenParam = if (!jsToken.isNullOrBlank()) "&jsToken=$jsToken" else ""
+                    val rootUrl = "https://$host/share/list?app_id=250528${tokenParam}&shorturl=$surl&root=1"
+                    val rootRes = runCatching {
+                        app.get(rootUrl, headers = headers, timeout = 5).parsedSafe<TeraBoxShareListResponse>()
+                    }.getOrNull()
+
+                    fun isVideo(item: TeraBoxFileInfo): Boolean {
+                        val name = item.serverFilename?.lowercase() ?: item.path?.lowercase() ?: ""
+                        return item.category?.toString() == "1" ||
+                                name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".webm") ||
+                                name.endsWith(".mov") || name.endsWith(".avi") || name.endsWith(".m4v") ||
+                                name.endsWith(".3gp") || (item.size ?: 0L) > 1_000_000L
                     }
+
+                    val videos = mutableListOf<TeraBoxFileInfo>()
+                    val rawList = rootRes?.list ?: listOfNotNull(initialFile)
+                    for (item in rawList) {
+                        val isDir = item.isdir?.toString() == "1"
+                        if (isDir && !item.path.isNullOrBlank()) {
+                            val subUrl = "https://$host/share/list?app_id=250528${tokenParam}&shorturl=$surl&dir=${URLEncoder.encode(item.path, "UTF-8")}&by=name&order=asc&num=20000"
+                            val subRes = runCatching {
+                                app.get(subUrl, headers = headers, timeout = 5).parsedSafe<TeraBoxShareListResponse>()
+                            }.getOrNull()
+                            subRes?.list?.filter { isVideo(it) }?.let { videos.addAll(it) }
+                        } else if (isVideo(item)) {
+                            videos.add(item)
+                        }
+                    }
+
+                    if (videos.isEmpty() && initialFile != null && isVideo(initialFile)) {
+                        videos.add(initialFile)
+                    }
+
+                    return@runCatching TeraBoxFolderResult(
+                        title = rootRes?.title ?: initialFile?.serverFilename,
+                        videos = videos,
+                        uk = uk,
+                        shareid = shareid,
+                        sign = sign,
+                        timestamp = timestamp,
+                        jsToken = jsToken,
+                        host = host,
+                        surl = surl
+                    )
                 }
-            }
-
-            val tokenParam = if (!jsToken.isNullOrBlank()) "&jsToken=$jsToken" else ""
-            val rootUrl = "https://$usedHost/share/list?app_id=250528${tokenParam}&shorturl=$surl&root=1"
-            val headers = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Cookie" to "ndus=$ndus",
-                "Referer" to "https://$usedHost/sharing/link?surl=$surl"
-            )
-
-            val rootRes = runCatching {
-                app.get(rootUrl, headers = headers, timeout = 5).parsedSafe<TeraBoxShareListResponse>()
+                null
             }.getOrNull()
+        }
 
-            val initialList = rootRes?.list
-            if (initialList.isNullOrEmpty()) return false
+        suspend fun resolveDirectTeraBox(
+            rawUrl: String,
+            callback: (ExtractorLink) -> Unit,
+            targetFsId: String? = null,
+            targetPath: String? = null
+        ): Boolean {
+            return runCatching {
+                val folderResult = fetchShareContents(rawUrl) ?: return false
+                val ndus = getSavedNdus()
+                val usedHost = folderResult.host
+                val surl = folderResult.surl
+                val jsToken = folderResult.jsToken
+                val sign = folderResult.sign
+                val timestamp = folderResult.timestamp
+                val uk = folderResult.uk
+                val shareid = folderResult.shareid
+                val tokenParam = if (!jsToken.isNullOrBlank()) "&jsToken=$jsToken" else ""
 
-            val firstVideo = initialList.firstOrNull { item ->
-                val name = item.serverFilename?.lowercase() ?: ""
-                name.endsWith(".mp4") || name.endsWith(".mkv") || name.endsWith(".webm") ||
-                name.endsWith(".mov") || name.endsWith(".avi") || name.endsWith(".m4v") ||
-                name.endsWith(".3gp") || (item.size ?: 0L) > 1_000_000L
-            } ?: initialList.firstOrNull() ?: return false
+                val targetVideo = if (!targetFsId.isNullOrBlank()) {
+                    folderResult.videos.firstOrNull { it.fsId?.toString() == targetFsId }
+                        ?: folderResult.videos.firstOrNull { it.path == targetPath }
+                        ?: folderResult.videos.firstOrNull()
+                } else {
+                    folderResult.videos.firstOrNull()
+                } ?: return false
 
-            val name = firstVideo.serverFilename?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "TeraBox Video"
-            val fid = firstVideo.fsId?.toString()
-            val path = firstVideo.path
+                val name = targetVideo.serverFilename?.removeSuffix(".mp4")?.removeSuffix(".mkv")?.replace("_", " ")?.trim() ?: "TeraBox Video"
+                val fid = targetFsId ?: targetVideo.fsId?.toString() ?: return false
+                val path = targetPath ?: targetVideo.path ?: return false
 
-            var found = false
-            val shareReferer = "https://$usedHost/sharing/link?surl=$surl"
-            val hlsHeaders = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Referer" to shareReferer,
-                "Cookie" to "ndus=$ndus"
-            )
-
-            if (!sign.isNullOrBlank() && !timestamp.isNullOrBlank() && !uk.isNullOrBlank() && !shareid.isNullOrBlank() && !fid.isNullOrBlank() && !path.isNullOrBlank()) {
-                val pathEnc = URLEncoder.encode(path, "UTF-8")
-                
-                // Probe available resolutions in parallel (1080p, 720p, 480p, 360p)
-                // Non-VIP accounts will succeed on 480p and 360p (1080p/720p return errno: 130)
-                // Premium/VIP accounts will automatically succeed on 1080p and 720p as well!
-                val resConfigs = listOf(
-                    VariantProbeConfig("1080p", "1920x1080", 5000000L, "M3U8_AUTO_1080", Qualities.P1080.value),
-                    VariantProbeConfig("720p", "1280x720", 2800000L, "M3U8_AUTO_720", Qualities.P720.value),
-                    VariantProbeConfig("480p", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value),
-                    VariantProbeConfig("360p", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value)
+                val shareReferer = "https://$usedHost/sharing/link?surl=$surl"
+                val hlsHeaders = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to shareReferer,
+                    "Cookie" to "ndus=$ndus"
                 )
 
-                val validVariants = coroutineScope {
-                    val jobs = resConfigs.map { cfg ->
-                        async {
-                            val streamUrl = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=${cfg.typeParam}&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
-                            val res = runCatching {
-                                app.get(streamUrl, headers = hlsHeaders, timeout = 5).text
-                            }.getOrNull()
+                if (!sign.isNullOrBlank() && !timestamp.isNullOrBlank() && !uk.isNullOrBlank() && !shareid.isNullOrBlank()) {
+                    val pathEnc = URLEncoder.encode(path, "UTF-8")
 
-                            if (res != null && res.contains("#EXTM3U") && !res.contains("\"errno\":130")) {
-                                HlsVariant(cfg.name, cfg.resolution, cfg.bandwidth, streamUrl)
-                            } else {
-                                null
+                    val resConfigs = listOf(
+                        VariantProbeConfig("1080p", "1920x1080", 5000000L, "M3U8_AUTO_1080", Qualities.P1080.value),
+                        VariantProbeConfig("720p", "1280x720", 2800000L, "M3U8_AUTO_720", Qualities.P720.value),
+                        VariantProbeConfig("480p", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value),
+                        VariantProbeConfig("360p", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value)
+                    )
+
+                    val validVariants = coroutineScope {
+                        val jobs = resConfigs.map { cfg ->
+                            async {
+                                val streamUrl = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=${cfg.typeParam}&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
+                                val res = runCatching {
+                                    app.get(streamUrl, headers = hlsHeaders, timeout = 5).text
+                                }.getOrNull()
+
+                                if (res != null && res.contains("#EXTM3U") && !res.contains("\"errno\":130")) {
+                                    HlsVariant(cfg.name, cfg.resolution, cfg.bandwidth, streamUrl)
+                                } else {
+                                    null
+                                }
                             }
                         }
+                        jobs.mapNotNull { it.await() }
                     }
-                    jobs.mapNotNull { it.await() }
+
+                    if (validVariants.isNotEmpty()) {
+                        val sortedVariants = validVariants.sortedByDescending { it.bandwidth }
+                        val masterContent = buildString {
+                            append("#EXTM3U\n")
+                            append("#EXT-X-VERSION:3\n")
+                            append("#EXT-X-INDEPENDENT-SEGMENTS\n")
+                            for (v in sortedVariants) {
+                                append("#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.name}\"\n")
+                                append("${v.url}\n")
+                            }
+                        }
+
+                        val streamId = (surl + "_" + (targetFsId ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
+                        val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
+
+                        callback(
+                            newExtractorLink(
+                                source = "$name Adaptive",
+                                name = "$name - [Adaptive Multi-Quality ⚡ (Unthrottled)]",
+                                url = masterUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = shareReferer
+                                this.headers = hlsHeaders
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        return true
+                    }
                 }
 
-                if (validVariants.isNotEmpty()) {
-                    val sortedVariants = validVariants.sortedByDescending { it.bandwidth }
-                    val masterContent = buildString {
-                        append("#EXTM3U\n")
-                        append("#EXT-X-VERSION:3\n")
-                        append("#EXT-X-INDEPENDENT-SEGMENTS\n")
-                        for (v in sortedVariants) {
-                            append("#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.name}\"\n")
-                            append("${v.url}\n")
-                        }
-                    }
+                // Direct MP4 fallback for VIP accounts or small files
+                val dlink = targetVideo.dlink
+                if (!dlink.isNullOrBlank() && dlink.startsWith("http")) {
+                    val headersMap = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to "https://www.1024terabox.com/",
+                        "Cookie" to "ndus=$ndus",
+                        "Accept" to "*/*",
+                        "Connection" to "keep-alive"
+                    )
 
-                    val streamId = surl.replace(Regex("[^a-zA-Z0-9_-]"), "")
-                    val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
+                    val finalStreamUrl = runCatching {
+                        val step = app.get(dlink, headers = headersMap, allowRedirects = false, timeout = 5)
+                        val loc = step.headers["Location"] ?: step.headers["location"]
+                        if (!loc.isNullOrBlank() && loc.startsWith("http")) loc else dlink
+                    }.getOrDefault(dlink)
 
-                    // Emit EXACTLY 1 Link to avoid modal clutter!
                     callback(
                         newExtractorLink(
-                            source = "$name Adaptive",
-                            name = "$name - [Adaptive Multi-Quality ⚡ (Unthrottled)]",
-                            url = masterUrl,
-                            type = ExtractorLinkType.M3U8
+                            source = "$name Direct",
+                            name = "$name - [Direct MP4 (VIP / Small Files)]",
+                            url = finalStreamUrl,
+                            type = ExtractorLinkType.VIDEO
                         ) {
-                            this.referer = shareReferer
-                            this.headers = hlsHeaders
-                            this.quality = Qualities.Unknown.value
+                            this.referer = "https://www.1024terabox.com/"
+                            this.headers = headersMap
+                            this.quality = Qualities.P1080.value
                         }
                     )
                     return true
                 }
-            }
 
-            // Direct MP4 fallback for VIP accounts or small files
-            val dlink = firstVideo.dlink
-            if (!dlink.isNullOrBlank() && dlink.startsWith("http")) {
-                val headersMap = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Referer" to "https://www.1024terabox.com/",
-                    "Cookie" to "ndus=$ndus",
-                    "Accept" to "*/*",
-                    "Connection" to "keep-alive"
-                )
+                false
+            }.getOrDefault(false)
+        }
+    }
 
-                val finalStreamUrl = runCatching {
-                    val step = app.get(dlink, headers = headersMap, allowRedirects = false, timeout = 5)
-                    val loc = step.headers["Location"] ?: step.headers["location"]
-                    if (!loc.isNullOrBlank() && loc.startsWith("http")) loc else dlink
-                }.getOrDefault(dlink)
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val cleanUrl = url.trim()
+        val ndus = getSavedNdus()
+        if (ndus.isNullOrBlank()) return
 
-                callback(
-                    newExtractorLink(
-                        source = "$name Direct",
-                        name = "$name - [Direct MP4 (VIP / Small Files)]",
-                        url = finalStreamUrl,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = "https://www.1024terabox.com/"
-                        this.headers = headersMap
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-                found = true
-            }
-
-            found
-        }.getOrDefault(false)
+        runCatching {
+            resolveDirectTeraBox(cleanUrl, callback)
+        }
     }
 }
 
@@ -526,7 +562,8 @@ data class TeraBoxPiniaShareInfo(
 
 data class TeraBoxShareListResponse(
     @JsonProperty("errno") val errno: Int? = null,
-    @JsonProperty("list") val list: List<TeraBoxFileInfo>? = null
+    @JsonProperty("list") val list: List<TeraBoxFileInfo>? = null,
+    @JsonProperty("title") val title: String? = null
 )
 
 data class TeraBoxFileInfo(
@@ -535,5 +572,18 @@ data class TeraBoxFileInfo(
     @JsonProperty("dlink") val dlink: String? = null,
     @JsonProperty("size") val size: Long? = null,
     @JsonProperty("isdir") val isdir: Any? = null,
+    @JsonProperty("category") val category: Any? = null,
     @JsonProperty("path") val path: String? = null
+)
+
+data class TeraBoxFolderResult(
+    val title: String?,
+    val videos: List<TeraBoxFileInfo>,
+    val uk: String?,
+    val shareid: String?,
+    val sign: String?,
+    val timestamp: String?,
+    val jsToken: String?,
+    val host: String,
+    val surl: String
 )

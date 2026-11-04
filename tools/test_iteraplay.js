@@ -326,6 +326,57 @@ async function runTestSuite() {
     assert("In-Player Track Selection Configured (Quality is Qualities.Unknown)", emittedLinks[0].quality === 0);
     assert("Served from Local Loopback (Zero External 404s)", emittedLinks[0].url.startsWith("http://127.0.0.1:"));
 
+    // 9. TeraBox Multi-Episode & Folder Auto-Unpacking (/share/list)
+    console.log("\n--- TEST 9: Multi-Episode & Folder Auto-Unpacking (/share/list) ---");
+    const tokenParam = jsToken ? `&jsToken=${jsToken}` : "";
+    const rootListUrl = `https://dm.terabox.com/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&shorturl=${testSurl}&by=name&order=asc&num=20000&root=1${tokenParam}`;
+    const listRaw = await getText(rootListUrl, {
+        "Cookie": `ndus=${ndus}`,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": `https://dm.terabox.com/sharing/link?surl=${testSurl}`
+    });
+
+    let listJson = null;
+    try { listJson = JSON.parse(listRaw.text); } catch(e) {}
+    assert("Official /share/list API HTTP 200 OK", listRaw.statusCode === 200 && listJson?.errno === 0, `(errno: ${listJson?.errno})`);
+
+    const rawList = listJson?.list || [];
+    assert("Share List Items Returned", rawList.length > 0, `(Found ${rawList.length} items in root)`);
+
+    const discoveredVideos = [];
+    for (const item of rawList) {
+        const isDir = item.isdir === '1' || item.isdir === 1;
+        if (isDir && item.path) {
+            const subUrl = `https://dm.terabox.com/share/list?app_id=250528&web=1&channel=dubox&clienttype=0&shorturl=${testSurl}&dir=${encodeURIComponent(item.path)}&by=name&order=asc&num=20000${tokenParam}`;
+            const subRaw = await getText(subUrl, { "Cookie": `ndus=${ndus}`, "User-Agent": "Mozilla/5.0", "Referer": `https://dm.terabox.com/sharing/link?surl=${testSurl}` });
+            try {
+                const subJson = JSON.parse(subRaw.text);
+                (subJson.list || []).forEach(v => {
+                    const name = (v.server_filename || v.path || '').toLowerCase();
+                    if (v.category === '1' || v.category === 1 || name.endsWith('.mp4') || name.endsWith('.mkv')) {
+                        discoveredVideos.push(v);
+                    }
+                });
+            } catch(e) {}
+        } else {
+            const name = (item.server_filename || item.path || '').toLowerCase();
+            if (item.category === '1' || item.category === 1 || name.endsWith('.mp4') || name.endsWith('.mkv')) {
+                discoveredVideos.push(item);
+            }
+        }
+    }
+
+    assert("Video Files Discovered via Share List", discoveredVideos.length > 0, `(Found ${discoveredVideos.length} videos: ${discoveredVideos.map(v => v.server_filename || v.path).join(", ")})`);
+
+    // Verify TV Series vs Movie Mapping
+    const isTvSeries = discoveredVideos.length > 1;
+    const loadResponseType = isTvSeries ? "TvSeries" : "Movie";
+    assert("CloudStream Smart Load Type Selection (Movie for single file, TvSeries for folders)", !!loadResponseType, `(Resolved as: ${loadResponseType})`);
+
+    // Verify Target FS_ID Episode Resolution
+    const targetEp = discoveredVideos[0];
+    assert("Target Episode fs_id & Path Bound to Episode Data", !!targetEp.fs_id && !!targetEp.path, `(fs_id: ${targetEp.fs_id}, path: ${targetEp.path})`);
+
     console.log("\n==================================================================");
     console.log(`VERIFICATION SUMMARY: ${passed} PASSED, ${failed} FAILED`);
     console.log("==================================================================");

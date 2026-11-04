@@ -15,6 +15,7 @@ cloudstream {
     status = 1
     tvTypes = listOf(
         "Movie",
+        "TvSeries",
         "Others"
     )
     iconUrl = "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
