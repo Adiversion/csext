@@ -221,9 +221,9 @@ class WaveFlixProvider : MainAPI() {
 
             // Fallback to Cinemeta if TMDB returned no episodes
             if (episodes.isEmpty() && !imdbId.isNullOrBlank()) {
-                runCatching {
+                try {
                     val cinRes = app.get("https://v3-cinemeta.strem.io/meta/series/$imdbId.json", timeout = 5)
-                        .parsedSafe<StremioOttProvider.CinemetaResponse>()
+                        .parsedSafe<CinemetaSeriesResponse>()
                     cinRes?.meta?.videos?.forEach { v ->
                         val sNum = v.season ?: 1
                         val epNum = v.episode ?: v.number ?: 1
@@ -246,6 +246,7 @@ class WaveFlixProvider : MainAPI() {
                             }
                         )
                     }
+                } catch (_: Throwable) {
                 }
             }
 
@@ -2285,6 +2286,28 @@ class WaveFlixProvider : MainAPI() {
     data class CinemetaMetaItem(
         @JsonProperty("id") val id: String? = null,
         @JsonProperty("name") val name: String? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class CinemetaSeriesResponse(
+        @JsonProperty("meta") val meta: CinemetaSeriesMeta? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class CinemetaSeriesMeta(
+        @JsonProperty("videos") val videos: List<CinemetaVideoItem>? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class CinemetaVideoItem(
+        @JsonProperty("season") val season: Int? = null,
+        @JsonProperty("number") val number: Int? = null,
+        @JsonProperty("episode") val episode: Int? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("overview") val overview: String? = null,
+        @JsonProperty("description") val description: String? = null,
+        @JsonProperty("thumbnail") val thumbnail: String? = null
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
