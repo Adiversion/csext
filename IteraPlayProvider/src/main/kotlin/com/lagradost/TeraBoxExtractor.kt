@@ -3,6 +3,7 @@ package com.lagradost
 import android.content.Context
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.nicehttp.NiceResponse
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import kotlinx.coroutines.async
@@ -389,7 +390,7 @@ open class TeraBoxExtractor : ExtractorApi() {
             val map = existing.toMutableMap()
             runCatching { map.putAll(res.cookies) }
             val rawList = runCatching {
-                res.headers.values("Set-Cookie").ifEmpty { res.headers.values("set-cookie") }
+                res.okhttpResponse.headers("Set-Cookie")
             }.getOrNull() ?: emptyList()
             for (line in rawList) {
                 val pair = line.substringBefore(";").trim()
