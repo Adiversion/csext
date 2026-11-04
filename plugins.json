@@ -23,10 +23,10 @@
     },
     {
         "iconUrl": "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png",
-        "fileHash": "sha256-4cdadf9ff5712d48eeb7ad221cb39822b009f7b617cd429ed14522568a647fe8",
+        "fileHash": "sha256-6a3e4e5f0e57ab8d262211d074a340da70ffc020b0769b7d6509336d433e16e2",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Adiversion/csext",
-        "fileSize": 77066,
+        "fileSize": 78081,
         "status": 1,
         "language": "en",
         "authors": [
@@ -37,7 +37,7 @@
             "TvSeries",
             "Others"
         ],
-        "version": 15,
+        "version": 16,
         "internalName": "IteraPlayProvider",
         "description": "iTeraPlay viral & premium TeraBox streaming player provider.",
         "url": "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlayProvider.cs3",
