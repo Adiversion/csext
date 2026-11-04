@@ -522,28 +522,12 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                     val variants = mutableListOf<HlsVariant>()
 
-                    // 1. 1080p from Flow Video Player (Unthrottled Worker Stream)
-                    if (flowStream?.direct1080Url != null) {
-                        val v1080M3u8 = """
-                            #EXTM3U
-                            #EXT-X-VERSION:3
-                            #EXT-X-TARGETDURATION:15000
-                            #EXT-X-PLAYLIST-TYPE:VOD
-                            #EXT-X-MEDIA-SEQUENCE:0
-                            #EXTINF:15000.0,
-                            ${flowStream.direct1080Url}
-                            #EXT-X-ENDLIST
-                        """.trimIndent()
-                        val v1080Url = LocalM3u8Server.set("v1080_$streamId", v1080M3u8)
-                        variants.add(HlsVariant("1080p", "1920x1080", 6000000L, v1080Url))
+                    // 1. Fast Unthrottled HLS Stream from Flow Video Player (Direct Cloudflare Worker HLS with .ts chunks)
+                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                        variants.add(HlsVariant("Fast Stream ⚡ (HD)", "1280x720", 3500000L, flowStream.fast720Url))
                     }
 
-                    // 2. 720p from Flow Video Player (Fast Worker HLS Stream)
-                    if (flowStream?.fast720Url != null) {
-                        variants.add(HlsVariant("720p", "1280x720", 3000000L, flowStream.fast720Url))
-                    }
-
-                    // 3 & 4. 480p and 360p from Native TeraBox
+                    // 2. Native Multi-Resolution HLS Streams from TeraBox (Probes VIP 1080p/720p and Non-VIP 480p/360p)
                     if (folderResult != null) {
                         val usedHost = folderResult.host
                         val jsToken = folderResult.jsToken
@@ -574,6 +558,8 @@ open class TeraBoxExtractor : ExtractorApi() {
                             )
 
                             val nativeConfigs = listOf(
+                                VariantProbeConfig("1080p (Native)", "1920x1080", 5000000L, "M3U8_AUTO_1080", Qualities.P1080.value),
+                                VariantProbeConfig("720p (Native)", "1280x720", 2800000L, "M3U8_AUTO_720", Qualities.P720.value),
                                 VariantProbeConfig("480p", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value),
                                 VariantProbeConfig("360p", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value)
                             )
@@ -614,15 +600,15 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                     val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
 
-                    // Unified single ExtractorLink containing all qualities (1080p, 720p, 480p, 360p)
+                    // Unified single ExtractorLink containing all genuine playable HLS streams
                     callback(
                         newExtractorLink(
                             source = "TeraBox Adaptive",
-                            name = "TeraBox - [Adaptive Multi-Quality ⚡ (1080p/720p/480p/360p)]",
+                            name = "TeraBox - [Adaptive Multi-Quality ⚡ (HD/480p/360p)]",
                             url = masterUrl,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            this.referer = "https://www.1024terabox.com/"
+                            this.referer = "https://flowvideoplayer.com/"
                             this.quality = Qualities.Unknown.value
                         }
                     )
