@@ -537,17 +537,52 @@ open class TeraBoxExtractor : ExtractorApi() {
                     val nativeDeferred = async { runCatching { fetchShareContents(rawUrl) }.getOrNull() }
 
                     val flowStream = flowDeferred.await()
-                    val folderResult = nativeDeferred.await()
 
+                    var emittedAny = false
+
+                    // 1. Emit FlowVideoPlayer Original 1080p Stream IMMEDIATELY (no waiting for native scraping)
+                    if (!flowStream?.direct1080Url.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Direct 1080p",
+                                name = "TeraBox - Original [1080p] (Direct Stream)",
+                                url = flowStream.direct1080Url,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Accept" to "*/*"
+                                )
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+                        emittedAny = true
+                    }
+
+                    // 2. Emit FlowVideoPlayer Fast Stream IMMEDIATELY
+                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Fast Stream",
+                                name = "TeraBox - Fast Stream ⚡ [480p] (Direct Stream)",
+                                url = flowStream.fast720Url,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://flowvideoplayer.com/"
+                                this.quality = Qualities.P480.value
+                            }
+                        )
+                        emittedAny = true
+                    }
+
+                    val folderResult = nativeDeferred.await()
                     val variants = mutableListOf<HlsVariant>()
 
-                    // 1. Fast Unthrottled HLS Stream from Flow Video Player (Direct Cloudflare Worker HLS with .ts chunks)
                     if (!flowStream?.fast720Url.isNullOrBlank()) {
-                        // Priority #1: 5 Mbps ensures ExoPlayer chooses this unthrottled HD stream first
                         variants.add(HlsVariant("Fast Stream ⚡ (720p HD)", "1280x720", 5000000L, flowStream.fast720Url))
                     }
 
-                    // 2. Native Multi-Resolution HLS Streams from TeraBox
+                    // 3. Native Multi-Resolution HLS Streams from TeraBox
                     if (folderResult != null) {
                         val usedHost = folderResult.host
                         val jsToken = folderResult.jsToken
@@ -578,7 +613,6 @@ open class TeraBoxExtractor : ExtractorApi() {
                             )
 
                             // Only probe VIP 1080p/720p if user has configured an official ndus account in Settings.
-                            // For free/guest users, TeraBox blocks 720p/1080p segments, which causes ExoPlayer to fail and fall back ("throw back") to 480p!
                             val nativeConfigs = mutableListOf<VariantProbeConfig>()
                             if (!ndus.isNullOrBlank()) {
                                 nativeConfigs.add(VariantProbeConfig("1080p (VIP)", "1920x1080", 6000000L, "M3U8_AUTO_1080", Qualities.P1080.value))
@@ -606,69 +640,36 @@ open class TeraBoxExtractor : ExtractorApi() {
                         }
                     }
 
-                    if (variants.isEmpty()) {
-                        return@coroutineScope false
-                    }
-
-                    // 1. Direct Original Full HD (1080p high-bitrate source file from TeraBox CDN via FlowVideoPlayer direct resolution)
-                    if (!flowStream?.direct1080Url.isNullOrBlank()) {
-                        callback(
-                            newExtractorLink(
-                                source = "TeraBox Direct 1080p",
-                                name = "TeraBox - Original [1080p] (Direct Stream)",
-                                url = flowStream.direct1080Url,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Accept" to "*/*"
-                                )
-                                this.quality = Qualities.P1080.value
+                    // 4. Multi-Resolution Adaptive Master Link (if variants found)
+                    if (variants.isNotEmpty()) {
+                        val sortedVariants = variants.sortedByDescending { it.bandwidth }
+                        val masterContent = buildString {
+                            append("#EXTM3U\n")
+                            append("#EXT-X-VERSION:3\n")
+                            append("#EXT-X-INDEPENDENT-SEGMENTS\n")
+                            for (v in sortedVariants) {
+                                append("#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.name}\"\n")
+                                append("${v.url}\n")
                             }
-                        )
-                    }
+                        }
 
-                    // 2. Standalone Fast Stream from Flow Video Player (Direct Cloudflare HLS, smooth playback, 480p)
-                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                        val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
+
                         callback(
                             newExtractorLink(
-                                source = "TeraBox Fast Stream",
-                                name = "TeraBox - Fast Stream ⚡ [480p] (Direct Stream)",
-                                url = flowStream.fast720Url,
+                                source = "TeraBox Adaptive",
+                                name = "TeraBox - [Adaptive 480p / 360p Master]",
+                                url = masterUrl,
                                 type = ExtractorLinkType.M3U8
                             ) {
                                 this.referer = "https://flowvideoplayer.com/"
-                                this.quality = Qualities.P480.value
+                                this.quality = Qualities.Unknown.value
                             }
                         )
+                        emittedAny = true
                     }
 
-                    // 3. Multi-Resolution Adaptive Master Link
-                    val sortedVariants = variants.sortedByDescending { it.bandwidth }
-                    val masterContent = buildString {
-                        append("#EXTM3U\n")
-                        append("#EXT-X-VERSION:3\n")
-                        append("#EXT-X-INDEPENDENT-SEGMENTS\n")
-                        for (v in sortedVariants) {
-                            append("#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.name}\"\n")
-                            append("${v.url}\n")
-                        }
-                    }
-
-                    val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
-
-                    callback(
-                        newExtractorLink(
-                            source = "TeraBox Adaptive",
-                            name = "TeraBox - [Adaptive 480p / 360p Master]",
-                            url = masterUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "https://flowvideoplayer.com/"
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    true
+                    emittedAny
                 }
             }.getOrDefault(false)
         }
