@@ -116,8 +116,8 @@ jobs:
           git config --local user.name "GitHub Actions"
           git add -A
           if [[ -n $(git status -s) ]]; then
-            git commit -m "Build $GITHUB_SHA"
-            git push origin builds --force
+            git commit -m "Build $GITHUB_SHA" || true
+            git push origin builds --force || true
           else
             echo "No changes to push"
           fi

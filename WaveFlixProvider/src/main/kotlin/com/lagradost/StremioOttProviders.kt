@@ -22,7 +22,7 @@ open class StremioOttProvider(
     val defaultType: TvType = TvType.TvSeries,
     val customMainPage: List<MainPageData>? = null
 ) : MainAPI() {
-    override var mainUrl = "https://www.waveflix.online"
+    override var mainUrl = "https://waveflix.online"
     override var lang = "en"
     override val supportedTypes = setOf(
         TvType.Movie,
@@ -344,15 +344,16 @@ open class StremioOttProvider(
             }
         }
 
-        // 2. Fallback: Search WaveFlix internal search API by title
+        // 2. Fallback: Search TMDB multi-search API by title
         if (!name.isNullOrBlank()) {
             val found = runCatching {
                 val enc = URLEncoder.encode(name, "UTF-8")
-                val searchRes = app.get("https://www.waveflix.online/api/search?q=$enc", timeout = 3)
+                val searchRes = app.get("https://api.tmdb.org/3/search/multi?api_key=4e44d9029b1270a757cddc766a1bcb63&query=$enc", timeout = 4)
                     .parsedSafe<WaveFlixProvider.WaveSearchResponse>()
                 val match = searchRes?.results?.firstOrNull()
                 val mid = match?.id
-                val poster = match?.posterPath?.let { "https://image.tmdb.org/t/p/w500$it" }
+                val rawPoster = match?.posterPath ?: match?.posterPathSnake
+                val poster = rawPoster?.let { "https://image.tmdb.org/t/p/w500$it" }
                 if (mid != null && mid > 0) {
                     TmdbResolvedMeta(mid, poster)
                 } else null

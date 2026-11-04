@@ -23,7 +23,7 @@ import javax.crypto.spec.SecretKeySpec
 
 class WaveFlixProvider : MainAPI() {
     override var name = "WaveFlix"
-    override var mainUrl = "https://www.waveflix.online"
+    override var mainUrl = "https://waveflix.online"
     override var lang = "en"
     override val supportedTypes = setOf(
         TvType.Movie,
@@ -36,6 +36,9 @@ class WaveFlixProvider : MainAPI() {
     companion object {
         private val homeCache = mutableMapOf<String, Pair<Long, HomePageResponse>>()
         private const val CACHE_TTL_MS = 15 * 60 * 1000L // 15 minutes cache for smooth UI
+        const val TMDB_API_KEY = "4e44d9029b1270a757cddc766a1bcb63"
+        const val TMDB_BASE_URL = "https://api.tmdb.org/3"
+        const val TMDB_FALLBACK_URL = "https://api.themoviedb.org/3"
     }
 
     override val mainPage = mainPageOf(
@@ -66,20 +69,32 @@ class WaveFlixProvider : MainAPI() {
         val mediaType = parts.getOrNull(0) ?: "movie"
         val category = parts.getOrNull(1) ?: "trending"
 
-        val endpoint = if (mediaType == "anime") {
-            "$mainUrl/api/discover?mediaType=anime&page=$page"
-        } else {
-            "$mainUrl/api/discover?mediaType=$mediaType&category=$category&page=$page"
+        val path = when {
+            mediaType == "anime" -> "discover/tv?with_genres=16&with_keywords=210024&sort_by=popularity.desc&page=$page"
+            mediaType == "tv" && category == "trending" -> "trending/tv/day?page=$page"
+            mediaType == "tv" && category == "on_the_air" -> "tv/on_the_air?page=$page"
+            mediaType == "tv" -> "tv/popular?page=$page"
+            category == "now_playing" -> "movie/now_playing?page=$page"
+            category == "top_rated" -> "movie/top_rated?page=$page"
+            category == "trending" -> "trending/movie/day?page=$page"
+            else -> "movie/popular?page=$page"
         }
 
-        val res = app.get(endpoint, headers = commonHeaders, timeout = 8)
-            .parsedSafe<WaveSearchResponse>() ?: throw ErrorLoadingException("Failed to fetch WaveFlix discover catalog")
+        val sep = if (path.contains("?")) "&" else "?"
+        val res = runCatching {
+            app.get("$TMDB_BASE_URL/$path${sep}api_key=$TMDB_API_KEY", headers = commonHeaders, timeout = 8)
+                .parsedSafe<WaveSearchResponse>()
+        }.getOrNull() ?: runCatching {
+            app.get("$TMDB_FALLBACK_URL/$path${sep}api_key=$TMDB_API_KEY", headers = commonHeaders, timeout = 8)
+                .parsedSafe<WaveSearchResponse>()
+        }.getOrNull() ?: throw ErrorLoadingException("Failed to fetch discovery catalog")
 
         val homeItems = res.results?.mapNotNull { item ->
             item.toSearchResponse()
         } ?: emptyList()
 
-        val hasNext = page < (res.totalPages ?: 1)
+        val totalP = res.totalPages ?: res.totalPagesSnake ?: 1
+        val hasNext = page < totalP
         val response = newHomePageResponse(request.name, homeItems, hasNext)
         synchronized(homeCache) {
             homeCache[cacheKey] = now to response
@@ -89,9 +104,14 @@ class WaveFlixProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val searchUrl = "$mainUrl/api/search?q=$encodedQuery"
-        val res = app.get(searchUrl, headers = commonHeaders)
-            .parsedSafe<WaveSearchResponse>() ?: return emptyList()
+        val searchPath = "search/multi?query=$encodedQuery&api_key=$TMDB_API_KEY"
+        val res = runCatching {
+            app.get("$TMDB_BASE_URL/$searchPath", headers = commonHeaders, timeout = 8)
+                .parsedSafe<WaveSearchResponse>()
+        }.getOrNull() ?: runCatching {
+            app.get("$TMDB_FALLBACK_URL/$searchPath", headers = commonHeaders, timeout = 8)
+                .parsedSafe<WaveSearchResponse>()
+        }.getOrNull() ?: return emptyList()
 
         return res.results?.mapNotNull { item ->
             item.toSearchResponse()
@@ -102,32 +122,33 @@ class WaveFlixProvider : MainAPI() {
         val isMovie = url.contains("/movie/")
         val idMatch = Regex("""/(?:details|watch)/(?:movie|tv)/(\d+)""").find(url)
         val tmdbId = idMatch?.groupValues?.get(1)?.toLongOrNull()
-            ?: throw ErrorLoadingException("Invalid WaveFlix media ID from URL: $url")
+            ?: throw ErrorLoadingException("Invalid media ID from URL: $url")
 
-        // Fetch page HTML to retrieve canonical title, synopsis, and poster
-        val doc = app.get(url, headers = commonHeaders).document
-        val rawTitle = doc.selectFirst("meta[property=og:image:alt]")?.attr("content")
-            ?: doc.selectFirst("meta[property=og:title]")?.attr("content")
-            ?: doc.selectFirst("h1")?.text()
-            ?: "Media #$tmdbId"
+        val itemType = if (isMovie) "movie" else "tv"
+        val detailPath = "$itemType/$tmdbId?api_key=$TMDB_API_KEY&append_to_response=external_ids"
 
-        val cleanTitle = rawTitle.removePrefix("Watch ").replace(Regex("""\s*\(\d{4}\).*"""), "").trim()
-        val plot = doc.selectFirst("meta[property=og:description]")?.attr("content")
-            ?: doc.selectFirst("meta[name=description]")?.attr("content")
-        val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-            ?.takeIf { it.isNotBlank() && !it.endsWith("/w500") && !it.endsWith("/w500/") }
-
-        val yearMatch = Regex("""\b(19\d{2}|20\d{2})\b""").find(rawTitle)
-        val year = yearMatch?.groupValues?.get(1)?.toIntOrNull()
-
-        // Resolve canonical IMDb ID via Cinemeta catalog search for 100% exact scraper matching (CSX methodology)
-        val imdbId = runCatching {
-            val qType = if (isMovie) "movie" else "series"
-            val cUrl = "https://v3-cinemeta.strem.io/catalog/$qType/top/search=${URLEncoder.encode(cleanTitle, "UTF-8")}.json"
-            val cRes = app.get(cUrl, timeout = 4).text
-            val cData = tryParseJson<CinemetaSearchResponse>(cRes)
-            cData?.metas?.firstOrNull()?.id?.takeIf { it.startsWith("tt") }
+        val tmdbRes = runCatching {
+            app.get("$TMDB_BASE_URL/$detailPath", headers = commonHeaders, timeout = 7).parsedSafe<TmdbDetailResponse>()
+        }.getOrNull() ?: runCatching {
+            app.get("$TMDB_FALLBACK_URL/$detailPath", headers = commonHeaders, timeout = 7).parsedSafe<TmdbDetailResponse>()
         }.getOrNull()
+
+        val cleanTitle = (tmdbRes?.title ?: tmdbRes?.name)?.trim() ?: "Media #$tmdbId"
+        val plot = tmdbRes?.overview
+        val poster = (tmdbRes?.posterPath ?: tmdbRes?.posterPathSnake)?.let { "https://image.tmdb.org/t/p/w500$it" }
+        val releaseDate = tmdbRes?.releaseDate ?: tmdbRes?.releaseDateSnake ?: tmdbRes?.firstAirDate ?: tmdbRes?.firstAirDateSnake
+        val year = releaseDate?.take(4)?.toIntOrNull()
+        var imdbId = tmdbRes?.externalIds?.imdbId?.takeIf { it.startsWith("tt") }
+
+        if (imdbId.isNullOrBlank()) {
+            imdbId = runCatching {
+                val qType = if (isMovie) "movie" else "series"
+                val cUrl = "https://v3-cinemeta.strem.io/catalog/$qType/top/search=${URLEncoder.encode(cleanTitle, "UTF-8")}.json"
+                val cRes = app.get(cUrl, timeout = 4).text
+                val cData = tryParseJson<CinemetaSearchResponse>(cRes)
+                cData?.metas?.firstOrNull()?.id?.takeIf { it.startsWith("tt") }
+            }.getOrNull()
+        }
 
         if (isMovie) {
             val linkData = WaveLinkData(
@@ -145,10 +166,11 @@ class WaveFlixProvider : MainAPI() {
             }
         } else {
             val episodes = mutableListOf<Episode>()
+            val totalSeasons = (tmdbRes?.numberOfSeasons ?: tmdbRes?.numberOfSeasonsSnake ?: 1).coerceAtMost(30)
 
             fun addSeasonEpisodes(seasonNum: Int, epList: List<WaveEpisodeItem>) {
                 epList.forEachIndexed { idx, ep ->
-                    val epNum = ep.episodeNumber ?: (idx + 1)
+                    val epNum = ep.episodeNumber ?: ep.episodeNumberSnake ?: (idx + 1)
                     val epData = WaveLinkData(
                         tmdbId = tmdbId,
                         isMovie = false,
@@ -159,8 +181,9 @@ class WaveFlixProvider : MainAPI() {
                         imdbId = imdbId
                     )
 
-                    val epPoster = if (!ep.stillPath.isNullOrBlank()) {
-                        "https://image.tmdb.org/t/p/w300${ep.stillPath}"
+                    val epStill = ep.stillPath ?: ep.stillPathSnake
+                    val epPoster = if (!epStill.isNullOrBlank()) {
+                        "https://image.tmdb.org/t/p/w300$epStill"
                     } else poster
 
                     episodes.add(
@@ -175,45 +198,53 @@ class WaveFlixProvider : MainAPI() {
                 }
             }
 
-            // 1. Fetch Season 1 first
-            val s1Res = try {
-                app.get("$mainUrl/api/season?tvId=$tmdbId&season=1", headers = commonHeaders, timeout = 7)
-                    .parsedSafe<WaveSeasonResponse>()
-            } catch (_: Throwable) {
-                null
+            // Fetch seasons concurrently in batches
+            coroutineScope {
+                val seasonJobs = (1..totalSeasons).map { sNum ->
+                    async {
+                        val sPath = "tv/$tmdbId/season/$sNum?api_key=$TMDB_API_KEY"
+                        val sRes = runCatching {
+                            app.get("$TMDB_BASE_URL/$sPath", headers = commonHeaders, timeout = 6).parsedSafe<WaveSeasonResponse>()
+                        }.getOrNull() ?: runCatching {
+                            app.get("$TMDB_FALLBACK_URL/$sPath", headers = commonHeaders, timeout = 6).parsedSafe<WaveSeasonResponse>()
+                        }.getOrNull()
+                        sNum to (sRes?.episodes ?: emptyList())
+                    }
+                }
+                val results = seasonJobs.awaitAll().sortedBy { it.first }
+                for ((sNum, eps) in results) {
+                    if (eps.isNotEmpty()) {
+                        addSeasonEpisodes(sNum, eps)
+                    }
+                }
             }
 
-            val s1List = s1Res?.episodes
-            if (!s1List.isNullOrEmpty()) {
-                addSeasonEpisodes(1, s1List)
-
-                // 2. Fetch subsequent seasons in concurrent batches of 4
-                coroutineScope {
-                    var nextBatchStart = 2
-                    var hasMore = true
-                    while (hasMore && nextBatchStart <= 25) {
-                        val batchRange = nextBatchStart until (nextBatchStart + 4)
-                        val seasonJobs = batchRange.map { sNum ->
-                            async {
-                                val sRes = try {
-                                    app.get("$mainUrl/api/season?tvId=$tmdbId&season=$sNum", headers = commonHeaders, timeout = 7)
-                                        .parsedSafe<WaveSeasonResponse>()
-                                } catch (_: Throwable) {
-                                    null
-                                }
-                                sNum to (sRes?.episodes ?: emptyList())
+            // Fallback to Cinemeta if TMDB returned no episodes
+            if (episodes.isEmpty() && !imdbId.isNullOrBlank()) {
+                runCatching {
+                    val cinRes = app.get("https://v3-cinemeta.strem.io/meta/series/$imdbId.json", timeout = 5)
+                        .parsedSafe<StremioOttProvider.CinemetaResponse>()
+                    cinRes?.meta?.videos?.forEach { v ->
+                        val sNum = v.season ?: 1
+                        val epNum = v.episode ?: v.number ?: 1
+                        val epData = WaveLinkData(
+                            tmdbId = tmdbId,
+                            isMovie = false,
+                            season = sNum,
+                            episode = epNum,
+                            title = cleanTitle,
+                            year = year,
+                            imdbId = imdbId
+                        )
+                        episodes.add(
+                            newEpisode(epData.toJson()) {
+                                this.name = v.name ?: v.title ?: "Episode $epNum"
+                                this.season = sNum
+                                this.episode = epNum
+                                this.posterUrl = v.thumbnail ?: poster
+                                this.description = v.overview ?: v.description
                             }
-                        }
-                        val results = seasonJobs.awaitAll().sortedBy { it.first }
-                        for ((sNum, eps) in results) {
-                            if (eps.isNotEmpty()) {
-                                addSeasonEpisodes(sNum, eps)
-                            } else {
-                                hasMore = false
-                                break
-                            }
-                        }
-                        nextBatchStart += 4
+                        )
                     }
                 }
             }
@@ -2131,10 +2162,12 @@ class WaveFlixProvider : MainAPI() {
 
     private fun WaveMediaItem.toSearchResponse(): SearchResponse? {
         val idVal = this.id ?: return null
-        val isMovie = (this.mediaType?.lowercase() == "movie")
+        val rawType = (this.mediaType ?: this.mediaTypeSnake)?.lowercase()
+        val isMovie = rawType != "tv"
         val titleVal = this.title ?: this.name ?: return null
-        val poster = if (!this.posterPath.isNullOrBlank()) {
-            if (this.posterPath.startsWith("http")) this.posterPath else "https://image.tmdb.org/t/p/w342${this.posterPath}"
+        val rawPoster = this.posterPath ?: this.posterPathSnake
+        val poster = if (!rawPoster.isNullOrBlank()) {
+            if (rawPoster.startsWith("http")) rawPoster else "https://image.tmdb.org/t/p/w342$rawPoster"
         } else null
 
         val targetUrl = "$mainUrl/details/${if (isMovie) "movie" else "tv"}/$idVal"
@@ -2155,6 +2188,7 @@ class WaveFlixProvider : MainAPI() {
     data class WaveSearchResponse(
         @JsonProperty("results") val results: List<WaveMediaItem>? = null,
         @JsonProperty("totalPages") val totalPages: Int? = null,
+        @JsonProperty("total_pages") val totalPagesSnake: Int? = null,
         @JsonProperty("page") val page: Int? = null
     )
 
@@ -2162,29 +2196,63 @@ class WaveFlixProvider : MainAPI() {
     data class WaveMediaItem(
         @JsonProperty("id") val id: Long? = null,
         @JsonProperty("mediaType") val mediaType: String? = null,
+        @JsonProperty("media_type") val mediaTypeSnake: String? = null,
         @JsonProperty("title") val title: String? = null,
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("overview") val overview: String? = null,
         @JsonProperty("posterPath") val posterPath: String? = null,
+        @JsonProperty("poster_path") val posterPathSnake: String? = null,
         @JsonProperty("backdropPath") val backdropPath: String? = null,
+        @JsonProperty("backdrop_path") val backdropPathSnake: String? = null,
         @JsonProperty("rating") val rating: Double? = null,
+        @JsonProperty("vote_average") val voteAverage: Double? = null,
         @JsonProperty("releaseDate") val releaseDate: String? = null,
-        @JsonProperty("firstAirDate") val firstAirDate: String? = null
+        @JsonProperty("release_date") val releaseDateSnake: String? = null,
+        @JsonProperty("firstAirDate") val firstAirDate: String? = null,
+        @JsonProperty("first_air_date") val firstAirDateSnake: String? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class TmdbDetailResponse(
+        @JsonProperty("id") val id: Long? = null,
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("overview") val overview: String? = null,
+        @JsonProperty("posterPath") val posterPath: String? = null,
+        @JsonProperty("poster_path") val posterPathSnake: String? = null,
+        @JsonProperty("backdropPath") val backdropPath: String? = null,
+        @JsonProperty("backdrop_path") val backdropPathSnake: String? = null,
+        @JsonProperty("releaseDate") val releaseDate: String? = null,
+        @JsonProperty("release_date") val releaseDateSnake: String? = null,
+        @JsonProperty("firstAirDate") val firstAirDate: String? = null,
+        @JsonProperty("first_air_date") val firstAirDateSnake: String? = null,
+        @JsonProperty("numberOfSeasons") val numberOfSeasons: Int? = null,
+        @JsonProperty("number_of_seasons") val numberOfSeasonsSnake: Int? = null,
+        @JsonProperty("external_ids") val externalIds: TmdbExternalIds? = null
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    data class TmdbExternalIds(
+        @JsonProperty("imdb_id") val imdbId: String? = null
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class WaveSeasonResponse(
         @JsonProperty("episodes") val episodes: List<WaveEpisodeItem>? = null,
-        @JsonProperty("season_number") val seasonNumber: Int? = null
+        @JsonProperty("seasonNumber") val seasonNumber: Int? = null,
+        @JsonProperty("season_number") val seasonNumberSnake: Int? = null
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     data class WaveEpisodeItem(
-        @JsonProperty("episode_number") val episodeNumber: Int? = null,
+        @JsonProperty("episodeNumber") val episodeNumber: Int? = null,
+        @JsonProperty("episode_number") val episodeNumberSnake: Int? = null,
         @JsonProperty("name") val name: String? = null,
         @JsonProperty("overview") val overview: String? = null,
-        @JsonProperty("still_path") val stillPath: String? = null,
-        @JsonProperty("vote_average") val voteAverage: Double? = null
+        @JsonProperty("stillPath") val stillPath: String? = null,
+        @JsonProperty("still_path") val stillPathSnake: String? = null,
+        @JsonProperty("voteAverage") val voteAverage: Double? = null,
+        @JsonProperty("vote_average") val voteAverageSnake: Double? = null
     )
 
     data class WaveLinkData(

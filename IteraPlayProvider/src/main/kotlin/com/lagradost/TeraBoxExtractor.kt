@@ -610,22 +610,40 @@ open class TeraBoxExtractor : ExtractorApi() {
                         return@coroutineScope false
                     }
 
-                    // 1. Standalone Direct Fast HD Link (Plays exclusively in 720p HD with no risk of falling back to 480p)
-                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                    // 1. Direct Original Full HD (1080p high-bitrate source file from TeraBox CDN via FlowVideoPlayer direct resolution)
+                    if (!flowStream?.direct1080Url.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
-                                source = "TeraBox Fast HD",
-                                name = "TeraBox - Fast HD ⚡ [720p] (Direct Stream)",
-                                url = flowStream.fast720Url,
-                                type = ExtractorLinkType.M3U8
+                                source = "TeraBox Direct 1080p",
+                                name = "TeraBox - Original [1080p] (Direct Stream)",
+                                url = flowStream.direct1080Url,
+                                type = ExtractorLinkType.VIDEO
                             ) {
-                                this.referer = "https://flowvideoplayer.com/"
-                                this.quality = Qualities.P720.value
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Accept" to "*/*"
+                                )
+                                this.quality = Qualities.P1080.value
                             }
                         )
                     }
 
-                    // 2. Multi-Resolution Adaptive Master Link
+                    // 2. Standalone Fast Stream from Flow Video Player (Direct Cloudflare HLS, smooth playback, 480p)
+                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Fast Stream",
+                                name = "TeraBox - Fast Stream ⚡ [480p] (Direct Stream)",
+                                url = flowStream.fast720Url,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://flowvideoplayer.com/"
+                                this.quality = Qualities.P480.value
+                            }
+                        )
+                    }
+
+                    // 3. Multi-Resolution Adaptive Master Link
                     val sortedVariants = variants.sortedByDescending { it.bandwidth }
                     val masterContent = buildString {
                         append("#EXTM3U\n")
@@ -642,7 +660,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     callback(
                         newExtractorLink(
                             source = "TeraBox Adaptive",
-                            name = "TeraBox - [Adaptive Fast HD ⚡ / 480p / 360p]",
+                            name = "TeraBox - [Adaptive 480p / 360p Master]",
                             url = masterUrl,
                             type = ExtractorLinkType.M3U8
                         ) {
