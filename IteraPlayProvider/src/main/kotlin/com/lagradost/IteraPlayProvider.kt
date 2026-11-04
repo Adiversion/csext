@@ -7,6 +7,10 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import java.net.URLEncoder
 
 class IteraPlayProvider : MainAPI() {
@@ -357,6 +361,23 @@ class IteraPlayProvider : MainAPI() {
         return Interceptor { chain ->
             val request = chain.request()
             val url = request.url.toString()
+            if (url.contains("127.0.0.1") || url.contains("master_")) {
+                val content = LocalM3u8Server.get(url) ?: run {
+                    val id = Regex("""master_([a-zA-Z0-9_\-]+)""").find(url)?.groupValues?.get(1)
+                    if (id != null) LocalM3u8Server.get(id) else null
+                }
+                if (content != null) {
+                    return@Interceptor Response.Builder()
+                        .request(request)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(content.toResponseBody("application/vnd.apple.mpegurl".toMediaTypeOrNull()))
+                        .addHeader("Content-Type", "application/vnd.apple.mpegurl")
+                        .addHeader("Access-Control-Allow-Origin", "*")
+                        .build()
+                }
+            }
             if (url.contains("terabox") || url.contains("1024tera") || extractorLink.source.contains("TeraBox")) {
                 val reqBuilder = request.newBuilder()
                 reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)

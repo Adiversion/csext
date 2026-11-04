@@ -7,8 +7,111 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
+
+data class HlsVariant(
+    val name: String,
+    val resolution: String,
+    val bandwidth: Long,
+    val url: String
+)
+
+private data class VariantProbeConfig(
+    val name: String,
+    val resolution: String,
+    val bandwidth: Long,
+    val typeParam: String,
+    val qualityVal: Int
+)
+
+object LocalM3u8Server {
+    private var serverSocket: ServerSocket? = null
+    private val playlists = ConcurrentHashMap<String, String>()
+    private val isRunning = AtomicBoolean(false)
+
+    val port: Int
+        get() = serverSocket?.localPort ?: 0
+
+    @Synchronized
+    fun start(): Int {
+        if (serverSocket != null && !serverSocket!!.isClosed) {
+            return serverSocket!!.localPort
+        }
+        return try {
+            val s = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+            serverSocket = s
+            isRunning.set(true)
+            thread(isDaemon = true, name = "LocalM3u8Server") {
+                while (isRunning.get() && !s.isClosed) {
+                    try {
+                        val client = s.accept()
+                        thread(isDaemon = true) {
+                            handleClient(client)
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+            s.localPort
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    private fun handleClient(socket: Socket) {
+        socket.use { s ->
+            try {
+                s.soTimeout = 4000
+                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                val firstLine = reader.readLine() ?: return
+                // Expected format: GET /master_<id>.m3u8 HTTP/1.1
+                val path = firstLine.split(" ").getOrNull(1) ?: return
+                val id = path.substringAfterLast("/").substringBefore(".m3u8")
+                val content = playlists[id] ?: playlists[path] ?: playlists["master_$id"]
+
+                val out = s.getOutputStream()
+                if (content != null) {
+                    val bytes = content.toByteArray(Charsets.UTF_8)
+                    val response = "HTTP/1.1 200 OK\r\n" +
+                            "Content-Type: application/vnd.apple.mpegurl\r\n" +
+                            "Content-Length: ${bytes.size}\r\n" +
+                            "Connection: close\r\n" +
+                            "Access-Control-Allow-Origin: *\r\n\r\n"
+                    out.write(response.toByteArray(Charsets.UTF_8))
+                    out.write(bytes)
+                    out.flush()
+                } else {
+                    val notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    out.write(notFound.toByteArray(Charsets.UTF_8))
+                    out.flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun serve(id: String, m3u8Content: String): String {
+        val p = start()
+        playlists[id] = m3u8Content
+        playlists["master_$id"] = m3u8Content
+        playlists["/master_$id.m3u8"] = m3u8Content
+        return "http://127.0.0.1:$p/master_$id.m3u8"
+    }
+
+    fun get(key: String): String? {
+        val id = key.substringAfterLast("/").substringBefore(".m3u8")
+        return playlists[key] ?: playlists[id] ?: playlists["master_$id"]
+    }
+}
 
 open class TeraBoxExtractor : ExtractorApi() {
     override val name = "TeraBox"
@@ -292,43 +395,59 @@ open class TeraBoxExtractor : ExtractorApi() {
                 // Non-VIP accounts will succeed on 480p and 360p (1080p/720p return errno: 130)
                 // Premium/VIP accounts will automatically succeed on 1080p and 720p as well!
                 val resConfigs = listOf(
-                    Triple("1080p", "M3U8_AUTO_1080", Qualities.P1080.value),
-                    Triple("720p", "M3U8_AUTO_720", Qualities.P720.value),
-                    Triple("480p", "M3U8_AUTO_480", Qualities.P480.value),
-                    Triple("360p", "M3U8_AUTO_360", Qualities.P360.value)
+                    VariantProbeConfig("1080p", "1920x1080", 5000000L, "M3U8_AUTO_1080", Qualities.P1080.value),
+                    VariantProbeConfig("720p", "1280x720", 2800000L, "M3U8_AUTO_720", Qualities.P720.value),
+                    VariantProbeConfig("480p", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value),
+                    VariantProbeConfig("360p", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value)
                 )
 
-                coroutineScope {
-                    val jobs = resConfigs.map { (qName, tParam, qVal) ->
+                val validVariants = coroutineScope {
+                    val jobs = resConfigs.map { cfg ->
                         async {
-                            val streamUrl = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=$tParam&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
+                            val streamUrl = "https://$usedHost/share/streaming?app_id=250528&channel=dubox&clienttype=0&shorturl=$surl&root=1&type=${cfg.typeParam}&path=$pathEnc${tokenParam}&uk=$uk&shareid=$shareid&fid=$fid&sign=$sign&timestamp=$timestamp"
                             val res = runCatching {
                                 app.get(streamUrl, headers = hlsHeaders, timeout = 5).text
                             }.getOrNull()
 
                             if (res != null && res.contains("#EXTM3U") && !res.contains("\"errno\":130")) {
-                                Triple(qName, streamUrl, qVal)
+                                HlsVariant(cfg.name, cfg.resolution, cfg.bandwidth, streamUrl)
                             } else {
                                 null
                             }
                         }
                     }
+                    jobs.mapNotNull { it.await() }
+                }
 
-                    jobs.mapNotNull { it.await() }.forEach { (qName, streamUrl, qVal) ->
-                        callback(
-                            newExtractorLink(
-                                source = "TeraBox $qName",
-                                name = "$name - [$qName Native HLS ⚡]",
-                                url = streamUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = shareReferer
-                                this.headers = hlsHeaders
-                                this.quality = qVal
-                            }
-                        )
-                        found = true
+                if (validVariants.isNotEmpty()) {
+                    val sortedVariants = validVariants.sortedByDescending { it.bandwidth }
+                    val masterContent = buildString {
+                        append("#EXTM3U\n")
+                        append("#EXT-X-VERSION:3\n")
+                        append("#EXT-X-INDEPENDENT-SEGMENTS\n")
+                        for (v in sortedVariants) {
+                            append("#EXT-X-STREAM-INF:BANDWIDTH=${v.bandwidth},RESOLUTION=${v.resolution},NAME=\"${v.name}\"\n")
+                            append("${v.url}\n")
+                        }
                     }
+
+                    val streamId = surl.replace(Regex("[^a-zA-Z0-9_-]"), "")
+                    val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
+
+                    // Emit EXACTLY 1 Link to avoid modal clutter!
+                    callback(
+                        newExtractorLink(
+                            source = "$name Adaptive",
+                            name = "$name - [Adaptive Multi-Quality ⚡ (Unthrottled)]",
+                            url = masterUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = shareReferer
+                            this.headers = hlsHeaders
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    return true
                 }
             }
 

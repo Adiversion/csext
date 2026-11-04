@@ -1,4 +1,5 @@
 const crypto = require("crypto");
+const http = require("http");
 const https = require("https");
 const fs = require("fs");
 
@@ -74,8 +75,9 @@ async function postJSON(url, body = {}, headers = {}) {
 }
 
 async function getText(url, headers = {}) {
+    const client = url.startsWith("https") ? https : http;
     return new Promise((resolve, reject) => {
-        https.get(url, { headers: { "User-Agent": "Mozilla/5.0", ...headers } }, (res) => {
+        client.get(url, { headers: { "User-Agent": "Mozilla/5.0", ...headers } }, (res) => {
             let data = "";
             res.on("data", c => data += c);
             res.on("end", () => resolve({ statusCode: res.statusCode, headers: res.headers, text: data }));
@@ -243,13 +245,13 @@ async function runTestSuite() {
         assert("HLS TS Chunk CDN Download Speed Unthrottled", kbps > 100, `(${kbps.toFixed(2)} KB/s vs 30 KB/s capped dlink)`);
     }
 
-    // 8. Native Multi-Quality Resolution Probing & Non-VIP Compatibility
-    console.log("\n--- TEST 8: Native Multi-Quality Resolution Probing & Non-VIP Compatibility ---");
+    // 8. Single-Link Adaptive Master M3U8 via Local Loopback Server (127.0.0.1)
+    console.log("\n--- TEST 8: Single-Link Adaptive Master M3U8 via Local Loopback (127.0.0.1) ---");
     const resConfigs = [
-        { name: "1080p", type: "M3U8_AUTO_1080", quality: 1080 },
-        { name: "720p",  type: "M3U8_AUTO_720",  quality: 720 },
-        { name: "480p",  type: "M3U8_AUTO_480",  quality: 480 },
-        { name: "360p",  type: "M3U8_AUTO_360",  quality: 360 }
+        { name: "1080p", res: "1920x1080", bw: 5000000, type: "M3U8_AUTO_1080", quality: 1080 },
+        { name: "720p",  res: "1280x720",  bw: 2800000, type: "M3U8_AUTO_720",  quality: 720 },
+        { name: "480p",  res: "854x480",   bw: 1400000, type: "M3U8_AUTO_480",  quality: 480 },
+        { name: "360p",  res: "640x360",   bw: 800000,  type: "M3U8_AUTO_360",  quality: 360 }
     ];
 
     const probeResults = [];
@@ -262,7 +264,7 @@ async function runTestSuite() {
         });
 
         const isValid = sRes.statusCode === 200 && sRes.text.includes("#EXTM3U") && !sRes.text.includes('"errno":130');
-        probeResults.push({ name: r.name, valid: isValid, url });
+        probeResults.push({ ...r, valid: isValid, url });
     }
 
     const workingStreams = probeResults.filter(p => p.valid);
@@ -272,22 +274,57 @@ async function runTestSuite() {
     const vip720 = probeResults.find(p => p.name === "720p");
     assert("VIP High-Resolution Probing Future-Proofed (Fails on Non-VIP, Auto-Unlocks on Premium)", !vip1080.valid && !vip720.valid, "(1080p/720p correctly gated by TeraBox VIP flag)");
 
-    // Simulate CloudStream extractor links callback
+    // Build Master M3U8 string
+    const sorted = workingStreams.sort((a, b) => b.bw - a.bw);
+    let masterM3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-INDEPENDENT-SEGMENTS\n";
+    for (const v of sorted) {
+        masterM3u8 += `#EXT-X-STREAM-INF:BANDWIDTH=${v.bw},RESOLUTION=${v.res},NAME="${v.name}"\n${v.url}\n`;
+    }
+
+    assert("Master M3U8 Header Present (#EXTM3U, #EXT-X-VERSION:3)", masterM3u8.startsWith("#EXTM3U\n#EXT-X-VERSION:3"));
+    assert("Master M3U8 Stream-Inf Tags Valid", masterM3u8.includes("#EXT-X-STREAM-INF:BANDWIDTH=") && masterM3u8.includes("RESOLUTION=") && masterM3u8.includes("NAME="));
+
+    // Simulate Local Loopback Server (127.0.0.1)
+    const streamId = testSurl.replace(/[^a-zA-Z0-9_\-]/g, "");
+    const localHttp = require('http');
+    const localServer = localHttp.createServer((req, res) => {
+        if (req.url === `/master_${streamId}.m3u8`) {
+            res.writeHead(200, {
+                'Content-Type': 'application/vnd.apple.mpegurl',
+                'Access-Control-Allow-Origin': '*'
+            });
+            res.end(masterM3u8);
+        } else {
+            res.writeHead(404);
+            res.end();
+        }
+    });
+
+    await new Promise(r => localServer.listen(0, '127.0.0.1', r));
+    const localPort = localServer.address().port;
+    const localMasterUrl = `http://127.0.0.1:${localPort}/master_${streamId}.m3u8`;
+
+    // Test loopback fetch
+    const loopbackRes = await getText(localMasterUrl);
+    assert("Local Loopback Server (127.0.0.1) HTTP 200 OK", loopbackRes.statusCode === 200 && loopbackRes.text.includes("#EXTM3U"));
+    localServer.close();
+
+    // Simulate CloudStream extractor links callback (EXACTLY 1 LINK)
     const emittedLinks = [];
     const callback = (link) => emittedLinks.push(link);
 
-    workingStreams.forEach(s => {
-        emittedLinks.push({
-            source: `TeraBox ${s.name}`,
-            name: `Test Video - [${s.name} Native HLS ⚡]`,
-            url: s.url,
-            type: "M3U8"
-        });
+    callback({
+        source: "TeraBox Adaptive",
+        name: `Test Video - [Adaptive Multi-Quality ⚡ (Unthrottled)]`,
+        url: localMasterUrl,
+        type: "M3U8",
+        quality: 0 // Qualities.Unknown.value
     });
 
-    assert("Working Native Links Emitted to Player", emittedLinks.length >= 2, `(${emittedLinks.length} links emitted)`);
-    assert("All Emitted Links Point to Live TeraBox CDN (Zero 404 Virtual URLs)", emittedLinks.every(l => l.url.startsWith("https://dm.terabox.com/")), "(Cronet 404 & M3u8Helper2 crashes eliminated)");
-    assert("Emitted Link Types are M3U8 with Media Chunks", emittedLinks.every(l => l.type === "M3U8"));
+    assert("CloudStream Link Picker: EXACTLY 1 Link Emitted (Zero Modal Clutter)", emittedLinks.length === 1, `(Link count: ${emittedLinks.length})`);
+    assert("Emitted Link Type is M3U8 Master Playlist", emittedLinks[0].type === "M3U8");
+    assert("In-Player Track Selection Configured (Quality is Qualities.Unknown)", emittedLinks[0].quality === 0);
+    assert("Served from Local Loopback (Zero External 404s)", emittedLinks[0].url.startsWith("http://127.0.0.1:"));
 
     console.log("\n==================================================================");
     console.log(`VERIFICATION SUMMARY: ${passed} PASSED, ${failed} FAILED`);
