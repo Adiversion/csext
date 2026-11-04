@@ -23,10 +23,10 @@
     },
     {
         "iconUrl": "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png",
-        "fileHash": "sha256-676861ba0c314000f5ee76e8ca5ee120da90b031b8b9cee747346d03752b6a63",
+        "fileHash": "sha256-648f03e89de2e0cd073fbb16c30bb6edd3559c1fcf16c2391bbe647cdc46c0fb",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Adiversion/csext",
-        "fileSize": 64821,
+        "fileSize": 70640,
         "status": 1,
         "language": "en",
         "authors": [
@@ -34,6 +34,7 @@
         ],
         "tvTypes": [
             "Movie",
+            "TvSeries",
             "Others"
         ],
         "version": 13,
