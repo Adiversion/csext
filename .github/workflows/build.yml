@@ -37,6 +37,12 @@ jobs:
           distribution: "temurin"
           java-version: 17
 
+      - name: Setup Gradle Cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          build-root-directory: "src"
+          cache-read-only: false
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
@@ -45,22 +51,28 @@ jobs:
           set -o pipefail
           cd $GITHUB_WORKSPACE/src
           chmod +x gradlew
+          
+          # Warmup JitPack maven metadata
           curl -s -L -f "https://jitpack.io/com/github/recloudstream/gradle/-SNAPSHOT/gradle--SNAPSHOT.pom" -o /dev/null || true
-          curl -s -L -f "https://jitpack.io/com/github/recloudstream/gradle/-SNAPSHOT/gradle--SNAPSHOT.jar" -o /dev/null || true
-          curl -s -L -f "https://jitpack.io/com/github/recloudstream/gradle/-32895aedb6-1/gradle--32895aedb6-1.pom" -o /dev/null || true
-          curl -s -L -f "https://jitpack.io/com/github/recloudstream/gradle/-32895aedb6-1/gradle--32895aedb6-1.jar" -o /dev/null || true
+          
           set +e
+          BUILD_STATUS=1
           for attempt in 1 2 3 4; do
             echo "Gradle build attempt $attempt of 4..."
-            ./gradlew :AnimePaheProvider:make :WaveFlixProvider:make :IteraPlayProvider:make makePluginsJson --no-daemon --stacktrace 2>&1 | tee build_output.log
+            REFRESH_FLAG=""
+            if [ $attempt -gt 1 ]; then
+              echo "Retrying with --refresh-dependencies to clear any transient resolution failure..."
+              REFRESH_FLAG="--refresh-dependencies"
+            fi
+            
+            ./gradlew :AnimePaheProvider:make :WaveFlixProvider:make :IteraPlayProvider:make makePluginsJson --parallel --build-cache $REFRESH_FLAG --stacktrace 2>&1 | tee build_output.log
             BUILD_STATUS=${PIPESTATUS[0]}
             if [ $BUILD_STATUS -eq 0 ]; then
               echo "Gradle build succeeded on attempt $attempt!"
               break
             fi
-            echo "Attempt $attempt failed with code $BUILD_STATUS, waiting 15s before retry..."
-            curl -s -L "https://jitpack.io/com/github/recloudstream/gradle/-SNAPSHOT/gradle--SNAPSHOT.pom" -o /dev/null || true
-            sleep 15
+            echo "Attempt $attempt failed with code $BUILD_STATUS, waiting 10s before retry..."
+            sleep 10
           done
           set -e
           
