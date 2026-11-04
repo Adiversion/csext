@@ -540,12 +540,24 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                     var emittedAny = false
 
-                    // 1. Emit FlowVideoPlayer Original 1080p Stream IMMEDIATELY (no waiting for native scraping)
+                    // Detect exact resolution from fileName
+                    val fNameLower = flowStream?.fileName?.lowercase() ?: ""
+                    val is4k = fNameLower.contains("4k") || fNameLower.contains("2160")
+                    val is720 = fNameLower.contains("720")
+                    val is1080 = fNameLower.contains("1080") || (!is4k && !is720)
+
+                    val (qualityVal, qualityLabel) = when {
+                        is4k -> Qualities.P2160.value to "4K"
+                        is720 -> Qualities.P720.value to "720p"
+                        else -> Qualities.P1080.value to "1080p"
+                    }
+
+                    // 1. Emit FlowVideoPlayer Original 1080p/720p Stream IMMEDIATELY (no waiting for native scraping)
                     if (!flowStream?.direct1080Url.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
-                                source = "TeraBox Direct 1080p",
-                                name = "TeraBox - Original [1080p] (Direct Stream)",
+                                source = "TeraBox Direct $qualityLabel",
+                                name = "TeraBox - Original [$qualityLabel] (Direct Stream)",
                                 url = flowStream.direct1080Url,
                                 type = ExtractorLinkType.VIDEO
                             ) {
@@ -553,14 +565,14 @@ open class TeraBoxExtractor : ExtractorApi() {
                                     "User-Agent" to USER_AGENT,
                                     "Accept" to "*/*"
                                 )
-                                this.quality = Qualities.P1080.value
+                                this.quality = qualityVal
                             }
                         )
                         emittedAny = true
                     }
 
-                    // 2. Emit FlowVideoPlayer Fast Stream IMMEDIATELY
-                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                    // Only emit 480p Fast Stream as absolute fallback if NO 1080p/720p stream could be resolved
+                    if (!emittedAny && !flowStream?.fast720Url.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Fast Stream",
@@ -578,11 +590,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     val folderResult = nativeDeferred.await()
                     val variants = mutableListOf<HlsVariant>()
 
-                    if (!flowStream?.fast720Url.isNullOrBlank()) {
-                        variants.add(HlsVariant("Fast Stream ⚡ (720p HD)", "1280x720", 5000000L, flowStream.fast720Url))
-                    }
-
-                    // 3. Native Multi-Resolution HLS Streams from TeraBox
+                    // 2. Native Multi-Resolution HLS Streams from TeraBox (Only 1080p & 720p HD)
                     if (folderResult != null) {
                         val usedHost = folderResult.host
                         val jsToken = folderResult.jsToken
@@ -612,14 +620,15 @@ open class TeraBoxExtractor : ExtractorApi() {
                                 "Cookie" to "ndus=$ndus"
                             )
 
-                            // Only probe VIP 1080p/720p if user has configured an official ndus account in Settings.
+                            // Strict 720p & 1080p only: probe exclusively HD VIP profiles when VIP ndus is present
                             val nativeConfigs = mutableListOf<VariantProbeConfig>()
                             if (!ndus.isNullOrBlank()) {
                                 nativeConfigs.add(VariantProbeConfig("1080p (VIP)", "1920x1080", 6000000L, "M3U8_AUTO_1080", Qualities.P1080.value))
                                 nativeConfigs.add(VariantProbeConfig("720p (VIP)", "1280x720", 3000000L, "M3U8_AUTO_720", Qualities.P720.value))
+                            } else if (!emittedAny) {
+                                // Absolute fallback if no direct stream
+                                nativeConfigs.add(VariantProbeConfig("480p (Native)", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value))
                             }
-                            nativeConfigs.add(VariantProbeConfig("480p (Native)", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value))
-                            nativeConfigs.add(VariantProbeConfig("360p (Native)", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value))
 
                             val nativeJobs = nativeConfigs.map { cfg ->
                                 async {
@@ -640,7 +649,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                         }
                     }
 
-                    // 4. Multi-Resolution Adaptive Master Link (if variants found)
+                    // 3. Multi-Resolution Adaptive Master Link (Strict 1080p / 720p HD Master)
                     if (variants.isNotEmpty()) {
                         val sortedVariants = variants.sortedByDescending { it.bandwidth }
                         val masterContent = buildString {
@@ -657,13 +666,13 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                         callback(
                             newExtractorLink(
-                                source = "TeraBox Adaptive",
-                                name = "TeraBox - [Adaptive 480p / 360p Master]",
+                                source = "TeraBox Adaptive HD",
+                                name = "TeraBox - [Adaptive HD 1080p / 720p Master]",
                                 url = masterUrl,
                                 type = ExtractorLinkType.M3U8
                             ) {
                                 this.referer = "https://flowvideoplayer.com/"
-                                this.quality = Qualities.Unknown.value
+                                this.quality = Qualities.P1080.value
                             }
                         )
                         emittedAny = true
