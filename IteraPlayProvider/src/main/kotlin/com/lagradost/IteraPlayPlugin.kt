@@ -96,16 +96,12 @@ class IteraPlayPlugin : Plugin() {
             val worker = TeraBoxExtractor.getSavedCustomWorker(act)
             when {
                 !ndus.isNullOrBlank() -> {
-                    statusView.text = "Status: 🟢 Direct Native TeraBox Active [ndus: ${ndus.take(6)}...]\n(Highest speed 1080p, bypasses all 3rd-party sites)"
+                    statusView.text = "Status: 🟢 Native TeraBox Active [ndus: ${ndus.take(6)}...]\n(Unthrottled HLS & Direct MP4 via official TeraBox CDN)"
                     statusView.setTextColor(Color.parseColor("#4CAF50"))
                 }
-                !worker.isNullOrBlank() -> {
-                    statusView.text = "Status: 🔵 Custom Gateway Worker Active\n($worker)"
-                    statusView.setTextColor(Color.parseColor("#2196F3"))
-                }
                 else -> {
-                    statusView.text = "Status: ⚪ Free Upstream Active\n(iTeraPlay.in Multi-Quality 1080p Engine)"
-                    statusView.setTextColor(Color.parseColor("#B0BEC5"))
+                    statusView.text = "Status: ⚪ No ndus Cookie Saved\n(Connect via login or paste ndus cookie below)"
+                    statusView.setTextColor(Color.parseColor("#FFA000"))
                 }
             }
         }
