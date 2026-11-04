@@ -385,16 +385,37 @@ open class TeraBoxExtractor : ExtractorApi() {
             }.getOrNull()
         }
 
+        private fun extractResponseCookies(res: NiceResponse, existing: Map<String, String> = emptyMap()): Map<String, String> {
+            val map = existing.toMutableMap()
+            runCatching { map.putAll(res.cookies) }
+            val rawList = runCatching {
+                res.headers.values("Set-Cookie").ifEmpty { res.headers.values("set-cookie") }
+            }.getOrNull() ?: emptyList()
+            for (line in rawList) {
+                val pair = line.substringBefore(";").trim()
+                val eq = pair.indexOf('=')
+                if (eq > 0) {
+                    val k = pair.substring(0, eq).trim()
+                    val v = pair.substring(eq + 1).trim()
+                    if (k.isNotBlank() && v.isNotBlank()) {
+                        map[k] = v
+                    }
+                }
+            }
+            return map
+        }
+
         suspend fun resolveFlowVideoPlayer(shareUrl: String): FlowResolvedStream? {
             return runCatching {
                 val baseUrl = "https://flowvideoplayer.com"
-                val userAgent = USER_AGENT
+                val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+                val secChUa = """"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99""""
 
                 val browserHeaders = mapOf(
                     "User-Agent" to userAgent,
-                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "Accept-Language" to "en-US,en;q=0.9",
-                    "Sec-Ch-Ua" to """"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"""",
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "Accept-Language" to "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Sec-Ch-Ua" to secChUa,
                     "Sec-Ch-Ua-Mobile" to "?0",
                     "Sec-Ch-Ua-Platform" to """"Windows"""",
                     "Sec-Fetch-Dest" to "document",
@@ -410,19 +431,19 @@ open class TeraBoxExtractor : ExtractorApi() {
                 val csrfToken = Regex("""name=["']csrf-token["']\s+content=["']([^"']+)["']""").find(homeHtml)?.groupValues?.get(1)
                     ?: return@runCatching null
 
-                val homeCookies = homeRes.cookies
-                val initialCookieHeader = homeCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                var cookies = extractResponseCookies(homeRes)
+                var cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
                 // 2. POST /device/init
                 val devicePayload = mapOf(
-                    "cpu" to 16,
+                    "cpu" to 4,
                     "memory" to 8,
                     "touch" to 0,
                     "platform" to "Win32",
-                    "lang" to "en-US",
+                    "lang" to "en-IN",
                     "vendor" to "Google Inc.",
                     "webgl_vendor" to "Google Inc. (NVIDIA)",
-                    "webgl_renderer" to "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                    "webgl_renderer" to "ANGLE (NVIDIA, NVIDIA GeForce GT 710 (0x0000128B) Direct3D11 vs_5_0 ps_5_0, D3D11)",
                     "ua" to userAgent,
                     "backup_token" to null,
                     "os" to "windows",
@@ -438,13 +459,13 @@ open class TeraBoxExtractor : ExtractorApi() {
                     "X-CSRF-TOKEN" to csrfToken,
                     "Origin" to baseUrl,
                     "Referer" to "$baseUrl/",
-                    "Sec-Ch-Ua" to """"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"""",
+                    "Sec-Ch-Ua" to secChUa,
                     "Sec-Ch-Ua-Mobile" to "?0",
                     "Sec-Ch-Ua-Platform" to """"Windows"""",
                     "Sec-Fetch-Dest" to "empty",
                     "Sec-Fetch-Mode" to "cors",
                     "Sec-Fetch-Site" to "same-origin",
-                    "Cookie" to initialCookieHeader
+                    "Cookie" to cookieHeader
                 )
 
                 val initRes = app.post(
@@ -454,15 +475,12 @@ open class TeraBoxExtractor : ExtractorApi() {
                     timeout = 10
                 )
 
-                val mergedCookies = mutableMapOf<String, String>()
-                mergedCookies.putAll(homeCookies)
-                mergedCookies.putAll(initRes.cookies)
-                val mergedCookieHeader = mergedCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+                cookies = extractResponseCookies(initRes, cookies)
+                cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
                 // 3. POST /search/video
                 val searchHeaders = initHeaders.toMutableMap()
-                searchHeaders["Accept"] = "application/json, text/plain, */*"
-                searchHeaders["Cookie"] = mergedCookieHeader
+                searchHeaders["Cookie"] = cookieHeader
 
                 val searchRes = app.post(
                     "$baseUrl/search/video",
@@ -482,7 +500,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                         dlApiUrl,
                         headers = mapOf(
                             "User-Agent" to userAgent,
-                            "Cookie" to mergedCookieHeader,
+                            "Cookie" to cookieHeader,
                             "Referer" to "$baseUrl/"
                         ),
                         allowRedirects = false,
@@ -524,10 +542,11 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                     // 1. Fast Unthrottled HLS Stream from Flow Video Player (Direct Cloudflare Worker HLS with .ts chunks)
                     if (!flowStream?.fast720Url.isNullOrBlank()) {
-                        variants.add(HlsVariant("Fast Stream ⚡ (HD)", "1280x720", 3500000L, flowStream.fast720Url))
+                        // Priority #1: 5 Mbps ensures ExoPlayer chooses this unthrottled HD stream first
+                        variants.add(HlsVariant("Fast Stream ⚡ (720p HD)", "1280x720", 5000000L, flowStream.fast720Url))
                     }
 
-                    // 2. Native Multi-Resolution HLS Streams from TeraBox (Probes VIP 1080p/720p and Non-VIP 480p/360p)
+                    // 2. Native Multi-Resolution HLS Streams from TeraBox
                     if (folderResult != null) {
                         val usedHost = folderResult.host
                         val jsToken = folderResult.jsToken
@@ -557,12 +576,15 @@ open class TeraBoxExtractor : ExtractorApi() {
                                 "Cookie" to "ndus=$ndus"
                             )
 
-                            val nativeConfigs = listOf(
-                                VariantProbeConfig("1080p (Native)", "1920x1080", 5000000L, "M3U8_AUTO_1080", Qualities.P1080.value),
-                                VariantProbeConfig("720p (Native)", "1280x720", 2800000L, "M3U8_AUTO_720", Qualities.P720.value),
-                                VariantProbeConfig("480p", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value),
-                                VariantProbeConfig("360p", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value)
-                            )
+                            // Only probe VIP 1080p/720p if user has configured an official ndus account in Settings.
+                            // For free/guest users, TeraBox blocks 720p/1080p segments, which causes ExoPlayer to fail and fall back ("throw back") to 480p!
+                            val nativeConfigs = mutableListOf<VariantProbeConfig>()
+                            if (!ndus.isNullOrBlank()) {
+                                nativeConfigs.add(VariantProbeConfig("1080p (VIP)", "1920x1080", 6000000L, "M3U8_AUTO_1080", Qualities.P1080.value))
+                                nativeConfigs.add(VariantProbeConfig("720p (VIP)", "1280x720", 3000000L, "M3U8_AUTO_720", Qualities.P720.value))
+                            }
+                            nativeConfigs.add(VariantProbeConfig("480p (Native)", "854x480", 1400000L, "M3U8_AUTO_480", Qualities.P480.value))
+                            nativeConfigs.add(VariantProbeConfig("360p (Native)", "640x360", 800000L, "M3U8_AUTO_360", Qualities.P360.value))
 
                             val nativeJobs = nativeConfigs.map { cfg ->
                                 async {
@@ -587,6 +609,22 @@ open class TeraBoxExtractor : ExtractorApi() {
                         return@coroutineScope false
                     }
 
+                    // 1. Standalone Direct Fast HD Link (Plays exclusively in 720p HD with no risk of falling back to 480p)
+                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Fast HD",
+                                name = "TeraBox - Fast HD ⚡ [720p] (Direct Stream)",
+                                url = flowStream.fast720Url,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://flowvideoplayer.com/"
+                                this.quality = Qualities.P720.value
+                            }
+                        )
+                    }
+
+                    // 2. Multi-Resolution Adaptive Master Link
                     val sortedVariants = variants.sortedByDescending { it.bandwidth }
                     val masterContent = buildString {
                         append("#EXTM3U\n")
@@ -600,11 +638,10 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                     val masterUrl = LocalM3u8Server.serve(streamId, masterContent)
 
-                    // Unified single ExtractorLink containing all genuine playable HLS streams
                     callback(
                         newExtractorLink(
                             source = "TeraBox Adaptive",
-                            name = "TeraBox - [Adaptive Multi-Quality ⚡ (HD/480p/360p)]",
+                            name = "TeraBox - [Adaptive Fast HD ⚡ / 480p / 360p]",
                             url = masterUrl,
                             type = ExtractorLinkType.M3U8
                         ) {
