@@ -406,7 +406,81 @@ open class TeraBoxExtractor : ExtractorApi() {
             return map
         }
 
-        suspend fun resolveFlowVideoPlayer(shareUrl: String): FlowResolvedStream? {
+        suspend fun fetchFlowVideos(shareUrl: String): List<FlowVideoItem> {
+            return runCatching {
+                val baseUrl = "https://flowvideoplayer.com"
+                val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+                val secChUa = """"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99""""
+
+                val browserHeaders = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer" to "$baseUrl/"
+                )
+
+                val homeRes = app.get(baseUrl, headers = browserHeaders, timeout = 10)
+                val csrfToken = Regex("""name=["']csrf-token["']\s+content=["']([^"']+)["']""").find(homeRes.text)?.groupValues?.get(1)
+                    ?: return@runCatching emptyList()
+
+                var cookies = extractResponseCookies(homeRes)
+                var cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                val initHeaders = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "application/json",
+                    "Content-Type" to "application/json",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "X-CSRF-TOKEN" to csrfToken,
+                    "Origin" to baseUrl,
+                    "Referer" to "$baseUrl/",
+                    "Sec-Ch-Ua" to secChUa,
+                    "Cookie" to cookieHeader
+                )
+
+                val initRes = app.post(
+                    "$baseUrl/device/init",
+                    headers = initHeaders,
+                    json = mapOf(
+                        "cpu" to 4,
+                        "memory" to 8,
+                        "touch" to 0,
+                        "platform" to "Win32",
+                        "lang" to "en-IN",
+                        "vendor" to "Google Inc.",
+                        "ua" to userAgent,
+                        "backup_token" to null,
+                        "os" to "windows",
+                        "browser" to "chrome",
+                        "pwa_installed" to false
+                    ),
+                    timeout = 10
+                )
+
+                cookies = extractResponseCookies(initRes, cookies)
+                cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                val searchHeaders = initHeaders.toMutableMap()
+                searchHeaders["Cookie"] = cookieHeader
+
+                val searchRes = app.post(
+                    "$baseUrl/search/video",
+                    headers = searchHeaders,
+                    json = mapOf("url" to shareUrl),
+                    timeout = 15
+                )
+
+                val searchJson = runCatching { parseJson<FlowSearchResponse>(searchRes.text) }.getOrNull()
+                searchJson?.response ?: emptyList()
+            }.getOrDefault(emptyList())
+        }
+
+        suspend fun resolveFlowVideoPlayer(
+            shareUrl: String,
+            targetFsId: String? = null,
+            targetPath: String? = null,
+            targetTitle: String? = null,
+            targetIndex: Int? = null
+        ): FlowResolvedStream? {
             return runCatching {
                 val baseUrl = "https://flowvideoplayer.com"
                 val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
@@ -491,11 +565,43 @@ open class TeraBoxExtractor : ExtractorApi() {
                 )
 
                 val searchJson = runCatching { parseJson<FlowSearchResponse>(searchRes.text) }.getOrNull()
-                val firstVid = searchJson?.response?.firstOrNull() ?: return@runCatching null
+                val vidList = searchJson?.response ?: return@runCatching null
+                if (vidList.isEmpty()) return@runCatching null
 
-                // 4. Resolve 302 location from download_url
+                // Pick the exact requested video from the folder list:
+                val targetVid = when {
+                    // Match by file name / path
+                    !targetPath.isNullOrBlank() -> {
+                        val targetName = targetPath.substringAfterLast('/').lowercase().trim()
+                        vidList.firstOrNull {
+                            val fn = it.fileName?.lowercase()?.trim() ?: ""
+                            fn == targetName ||
+                            fn.contains(targetName.removeSuffix(".mp4").removeSuffix(".mkv")) ||
+                            targetName.contains(fn.removeSuffix(".mp4").removeSuffix(".mkv"))
+                        }
+                    }
+                    // Match by clean title
+                    !targetTitle.isNullOrBlank() -> {
+                        val cleanTitle = targetTitle.lowercase().replace("_", " ").trim()
+                        vidList.firstOrNull {
+                            val fn = it.fileName?.lowercase()?.replace("_", " ")?.trim() ?: ""
+                            fn.contains(cleanTitle) || cleanTitle.contains(fn.removeSuffix(".mp4").removeSuffix(".mkv"))
+                        }
+                    }
+                    else -> null
+                } ?: run {
+                    // Match by episode index (0-based)
+                    if (targetIndex != null && targetIndex in 0 until vidList.size) {
+                        vidList[targetIndex]
+                    } else {
+                        // Default to first video
+                        vidList.first()
+                    }
+                }
+
+                // 4. Resolve 302 location from download_url of target video
                 var direct1080Url: String? = null
-                val dlApiUrl = firstVid.downloadUrl
+                val dlApiUrl = targetVid.downloadUrl
                 if (!dlApiUrl.isNullOrBlank()) {
                     val dirStep = app.get(
                         dlApiUrl,
@@ -514,10 +620,10 @@ open class TeraBoxExtractor : ExtractorApi() {
                 }
 
                 FlowResolvedStream(
-                    fileName = firstVid.fileName,
+                    fileName = targetVid.fileName,
                     direct1080Url = direct1080Url,
-                    fast720Url = firstVid.fastStreamUrl,
-                    fileSize = firstVid.fileSize
+                    fast720Url = targetVid.fastStreamUrl,
+                    fileSize = targetVid.fileSize
                 )
             }.getOrNull()
         }
@@ -526,14 +632,16 @@ open class TeraBoxExtractor : ExtractorApi() {
             rawUrl: String,
             callback: (ExtractorLink) -> Unit,
             targetFsId: String? = null,
-            targetPath: String? = null
+            targetPath: String? = null,
+            targetTitle: String? = null,
+            targetIndex: Int? = null
         ): Boolean {
             return runCatching {
                 val surl = extractSurl(rawUrl) ?: return false
-                val streamId = (surl + "_" + (targetFsId ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
+                val streamId = (surl + "_" + (targetFsId ?: targetIndex?.toString() ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
 
                 coroutineScope {
-                    val flowDeferred = async { resolveFlowVideoPlayer(rawUrl) }
+                    val flowDeferred = async { resolveFlowVideoPlayer(rawUrl, targetFsId, targetPath, targetTitle, targetIndex) }
                     val nativeDeferred = async { runCatching { fetchShareContents(rawUrl) }.getOrNull() }
 
                     val flowStream = flowDeferred.await()
@@ -604,7 +712,14 @@ open class TeraBoxExtractor : ExtractorApi() {
                         val targetVideo = if (!targetFsId.isNullOrBlank()) {
                             folderResult.videos.firstOrNull { it.fsId?.toString() == targetFsId }
                                 ?: folderResult.videos.firstOrNull { it.path == targetPath }
+                                ?: (if (targetIndex != null && targetIndex in 0 until folderResult.videos.size) folderResult.videos[targetIndex] else null)
                                 ?: folderResult.videos.firstOrNull()
+                        } else if (!targetPath.isNullOrBlank()) {
+                            folderResult.videos.firstOrNull { it.path == targetPath }
+                                ?: (if (targetIndex != null && targetIndex in 0 until folderResult.videos.size) folderResult.videos[targetIndex] else null)
+                                ?: folderResult.videos.firstOrNull()
+                        } else if (targetIndex != null && targetIndex in 0 until folderResult.videos.size) {
+                            folderResult.videos[targetIndex]
                         } else {
                             folderResult.videos.firstOrNull()
                         }

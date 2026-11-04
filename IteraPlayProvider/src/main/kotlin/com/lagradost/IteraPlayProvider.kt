@@ -222,7 +222,8 @@ class IteraPlayProvider : MainAPI() {
                         title = epTitle,
                         poster = poster,
                         fsId = v.fsId?.toString(),
-                        filePath = v.path
+                        filePath = v.path,
+                        episodeIndex = idx
                     )
                     newEpisode(epData.toJson()) {
                         this.name = epTitle
@@ -239,6 +240,38 @@ class IteraPlayProvider : MainAPI() {
                 ) {
                     this.posterUrl = poster
                     this.plot = "TeraBox folder containing ${folderRes.videos.size} episodes."
+                }
+            } else {
+                // If native TeraBox didn't return multiple videos, query FlowVideoPlayer for folder items
+                val flowVideos = runCatching { TeraBoxExtractor.fetchFlowVideos(teraboxUrl) }.getOrNull() ?: emptyList()
+                if (flowVideos.size > 1) {
+                    val episodes = flowVideos.mapIndexed { idx, v ->
+                        val epTitle = v.fileName?.removeSuffix(".mp4")?.removeSuffix(".mkv")?.replace("_", " ")?.trim()
+                            ?: "Episode ${idx + 1}"
+                        val epData = IteraLinkData(
+                            videoId = videoId,
+                            teraboxUrl = teraboxUrl,
+                            title = epTitle,
+                            poster = poster,
+                            filePath = v.fileName,
+                            episodeIndex = idx
+                        )
+                        newEpisode(epData.toJson()) {
+                            this.name = epTitle
+                            this.episode = idx + 1
+                            this.posterUrl = poster
+                        }
+                    }
+
+                    return newTvSeriesLoadResponse(
+                        name = title,
+                        url = url,
+                        type = TvType.TvSeries,
+                        episodes = episodes
+                    ) {
+                        this.posterUrl = poster
+                        this.plot = "TeraBox folder containing ${flowVideos.size} episodes."
+                    }
                 }
             }
         }
@@ -322,7 +355,9 @@ class IteraPlayProvider : MainAPI() {
                 teraboxUrl,
                 customCallback,
                 targetFsId = linkData.fsId,
-                targetPath = linkData.filePath
+                targetPath = linkData.filePath,
+                targetTitle = linkData.title,
+                targetIndex = linkData.episodeIndex
             )
         }
 
@@ -474,5 +509,6 @@ data class IteraLinkData(
     val title: String? = null,
     val poster: String? = null,
     val fsId: String? = null,
-    val filePath: String? = null
+    val filePath: String? = null,
+    val episodeIndex: Int? = null
 )
