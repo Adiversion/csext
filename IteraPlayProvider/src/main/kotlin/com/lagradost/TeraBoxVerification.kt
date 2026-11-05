@@ -15,6 +15,7 @@ import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -41,6 +42,9 @@ object TeraBoxVerification {
     private var cachedCookies: String? = null
     private var cachedExpSeconds: Long = 0L
 
+    @Volatile
+    private var cachedFetchedItems: List<Tera1024Item>? = null
+
     data class Tera1024Item(
         val fsId: String? = null,
         val fileName: String? = null,
@@ -51,6 +55,13 @@ object TeraBoxVerification {
         val isDir: Boolean = false,
         val path: String? = null
     )
+
+    class TeraBoxBridge(private val onResult: (cookies: String?, dataJson: String?) -> Unit) {
+        @JavascriptInterface
+        fun onVerified(cookieStr: String?, dataJson: String?) {
+            onResult(cookieStr, dataJson)
+        }
+    }
 
     fun isTokenValid(): Boolean {
         if (cachedCookies == null) {
@@ -84,7 +95,7 @@ object TeraBoxVerification {
             prefs.edit()
                 .putString(KEY_TDL_COOKIES, cookies)
                 .putLong(KEY_TDL_EXP, expSeconds)
-                .apply()
+                .commit()
             Log.d(TAG, "Saved Turnstile session cookies to SharedPreferences (exp=$expSeconds)")
         }
     }
@@ -105,6 +116,39 @@ object TeraBoxVerification {
                     activityField.get(record) as? Activity
                 } else null
             }
+        }.getOrNull()
+    }
+
+    fun parse1024Response(responseText: String): List<Tera1024Item>? {
+        return runCatching {
+            val json = JSONObject(responseText)
+            val listArr = json.optJSONArray("list") ?: return@runCatching null
+            val results = mutableListOf<Tera1024Item>()
+            for (i in 0 until listArr.length()) {
+                val item = listArr.optJSONObject(i) ?: continue
+                val fsId = item.optString("fs_id").ifBlank { null }
+                val fileName = item.optString("server_filename").ifBlank { item.optString("file_name") }
+                val size = item.optLong("size", 0L)
+                val directLink = item.optString("direct_link").ifBlank { item.optString("dlink") }
+                val streamUrl = item.optString("stream_url").ifBlank { null }
+                val streamDownloadUrl = item.optString("stream_download_url").ifBlank { null }
+                val isDir = item.optInt("isdir", 0) == 1
+                val path = item.optString("path").ifBlank { null }
+
+                results.add(
+                    Tera1024Item(
+                        fsId = fsId,
+                        fileName = fileName,
+                        size = size,
+                        directLink = directLink.ifBlank { null },
+                        streamUrl = streamUrl,
+                        streamDownloadUrl = streamDownloadUrl,
+                        isDir = isDir,
+                        path = path
+                    )
+                )
+            }
+            results
         }.getOrNull()
     }
 
@@ -263,33 +307,82 @@ object TeraBoxVerification {
 
                 var pollElapsedMs = 0L
 
-                fun finishWithCookies(cookies: String) {
+                fun finishWithVerification(cookieStr: String?, dataJson: String?) {
                     if (solved) return
                     solved = true
                     handler.removeCallbacks(revealRunnable)
                     cookieManager.flush()
 
-                    val expMatch = Regex("""tdl_pass_exp=(\d+)""").find(cookies)
+                    val cm1 = cookieManager.getCookie("https://1024teradl.com/") ?: ""
+                    val cm2 = cookieManager.getCookie("https://1024teradl.com") ?: ""
+                    val cm3 = cookieManager.getCookie("https://player.1024teradl.com/") ?: ""
+                    val cm4 = cookieManager.getCookie(".1024teradl.com") ?: ""
+                    val cJs = cookieStr ?: ""
+
+                    val allRaw = listOf(cm1, cm2, cm3, cm4, cJs)
+                    val mergedCookies = allRaw.flatMap { it.split(";") }
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() && it.contains("=") }
+                        .distinct()
+                        .joinToString("; ")
+
+                    Log.d(TAG, "Turnstile verification finished! Captured merged cookies: $mergedCookies")
+
+                    val expMatch = Regex("""tdl_pass_exp=(\d+)""").find(mergedCookies)
                     val expVal = expMatch?.groupValues?.get(1)?.toLongOrNull()
                         ?: (System.currentTimeMillis() / 1000L + 86400L)
-                    saveSession(activity, cookies, expVal)
+
+                    saveSession(activity, mergedCookies, expVal)
+
+                    if (!dataJson.isNullOrBlank() && dataJson.contains("\"list\"")) {
+                        parse1024Response(dataJson)?.let { items ->
+                            if (items.isNotEmpty()) {
+                                cachedFetchedItems = items
+                                Log.d(TAG, "Turnstile WebView pre-fetched ${items.size} 1080p stream items!")
+                            }
+                        }
+                    }
+
                     success = true
                     latch.countDown()
                     handler.postDelayed({
                         runCatching { if (dialog.isShowing) dialog.dismiss() }
-                    }, 300L)
+                    }, 350L)
                 }
+
+                webView.addJavascriptInterface(
+                    TeraBoxBridge { cookies, dataJson ->
+                        activity.runOnUiThread {
+                            Log.d(TAG, "Turnstile verified via JavaScript Bridge! cookies='$cookies', hasData=${!dataJson.isNullOrBlank()}")
+                            finishWithVerification(cookies, dataJson)
+                        }
+                    },
+                    "AndroidBridge"
+                )
 
                 lateinit var cookiePollRunnable: Runnable
                 cookiePollRunnable = Runnable {
                     if (solved) return@Runnable
                     pollElapsedMs += 600L
-                    val currentCookies = cookieManager.getCookie(BASE_URL) ?: ""
-                    if (currentCookies.contains("tdl_pass=")) {
-                        Log.d(TAG, "Turnstile verification successful! Captured cookies: $currentCookies")
-                        finishWithCookies(currentCookies)
+
+                    val cm1 = cookieManager.getCookie("https://1024teradl.com/") ?: ""
+                    val cm2 = cookieManager.getCookie("https://1024teradl.com") ?: ""
+                    val combined = "$cm1; $cm2"
+                    if (combined.contains("tdl_pass")) {
+                        Log.d(TAG, "Detected tdl_pass via CookieManager poll: $combined")
+                        finishWithVerification(combined, null)
                         return@Runnable
                     }
+
+                    webView.evaluateJavascript("(function(){ return document.cookie || ''; })()") { jsVal ->
+                        val cleaned = jsVal?.replace("\"", "")?.trim() ?: ""
+                        if (cleaned.contains("tdl_pass")) {
+                            Log.d(TAG, "Detected tdl_pass via document.cookie poll: $cleaned")
+                            finishWithVerification(cleaned, null)
+                            return@evaluateJavascript
+                        }
+                    }
+
                     if (pollElapsedMs >= 65_000L) {
                         Log.w(TAG, "Turnstile verification timed out after 65s")
                         latch.countDown()
@@ -310,9 +403,11 @@ object TeraBoxVerification {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         super.onPageFinished(view, url)
                         progressBar.visibility = View.GONE
-                        val currentCookies = cookieManager.getCookie(BASE_URL) ?: ""
-                        if (currentCookies.contains("tdl_pass=")) {
-                            finishWithCookies(currentCookies)
+                        val cm1 = cookieManager.getCookie("https://1024teradl.com/") ?: ""
+                        val cm2 = cookieManager.getCookie("https://1024teradl.com") ?: ""
+                        val currentCookies = "$cm1; $cm2"
+                        if (currentCookies.contains("tdl_pass")) {
+                            finishWithVerification(currentCookies, null)
                             return
                         }
 
@@ -323,6 +418,80 @@ object TeraBoxVerification {
                             (function() {
                                 if (window.__tb_verified_injected) return;
                                 window.__tb_verified_injected = true;
+
+                                function notifyAndroid(dataText) {
+                                    try {
+                                        var c = document.cookie || '';
+                                        if (window.AndroidBridge && window.AndroidBridge.onVerified) {
+                                            window.AndroidBridge.onVerified(c, dataText || '');
+                                        }
+                                    } catch(e) {
+                                        console.error('AndroidBridge call error:', e);
+                                    }
+                                }
+
+                                // Hook fetch so any successful /api/verify or /api/proxy immediately signals Android
+                                var _origFetch = window.fetch;
+                                window.fetch = function(url, opts) {
+                                    var p = _origFetch.apply(this, arguments);
+                                    if (typeof url === 'string') {
+                                        if (url.indexOf('/api/proxy') !== -1) {
+                                            p.then(function(r) {
+                                                if (r && r.ok) {
+                                                    r.clone().text().then(function(t) {
+                                                        if (t && t.indexOf('list') !== -1) {
+                                                            notifyAndroid(t);
+                                                        }
+                                                    }).catch(function() {});
+                                                }
+                                            }).catch(function() {});
+                                        } else if (url.indexOf('/api/verify') !== -1) {
+                                            p.then(function(r) {
+                                                if (r && r.ok) {
+                                                    setTimeout(function() {
+                                                        notifyAndroid('');
+                                                    }, 300);
+                                                }
+                                            }).catch(function() {});
+                                        }
+                                    }
+                                    return p;
+                                };
+
+                                function handleTokenSuccess(token) {
+                                    var statusDiv = document.getElementById('__tb_status');
+                                    if (statusDiv) statusDiv.innerText = 'Token verified! Unlocking 1080p stream...';
+
+                                    fetch('/api/verify', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ token: token })
+                                    }).then(function(r) {
+                                        return r.json().catch(function() { return {}; });
+                                    }).then(function(res) {
+                                        if (statusDiv) statusDiv.innerText = 'Success! Closing window...';
+
+                                        var targetUrl = '$escapedFillUrl';
+                                        if (targetUrl && targetUrl.length > 5) {
+                                            fetch('/api/proxy', {
+                                                method: 'POST',
+                                                headers: { 'Content-Type': 'application/json' },
+                                                body: JSON.stringify({ url: targetUrl })
+                                            }).then(function(pr) {
+                                                return pr.text();
+                                            }).then(function(dataText) {
+                                                notifyAndroid(dataText);
+                                            }).catch(function() {
+                                                notifyAndroid('');
+                                            });
+                                        } else {
+                                            notifyAndroid('');
+                                        }
+                                    }).catch(function(err) {
+                                        if (statusDiv) statusDiv.innerText = 'Success! Closing window...';
+                                        notifyAndroid('');
+                                    });
+                                }
 
                                 // 1. Direct Turnstile Explicit Renderer (Guarantees Turnstile is always visible on screen)
                                 function mountTurnstile() {
@@ -359,18 +528,7 @@ object TeraBoxVerification {
                                             window.turnstile.render('#__tb_widget', {
                                                 sitekey: '0x4AAAAAAFZHusiSezRUKq4-',
                                                 theme: 'dark',
-                                                callback: function(token) {
-                                                    statusDiv.innerText = 'Token verified! Unlocking 1080p stream...';
-                                                    fetch('/api/verify', {
-                                                        method: 'POST',
-                                                        headers: { 'Content-Type': 'application/json' },
-                                                        body: JSON.stringify({ token: token })
-                                                    }).then(function(r) { return r.json(); }).then(function(res) {
-                                                        statusDiv.innerText = 'Success! Closing window...';
-                                                    }).catch(function(err) {
-                                                        statusDiv.innerText = 'Verified! Closing...';
-                                                    });
-                                                },
+                                                callback: handleTokenSuccess,
                                                 'error-callback': function() {
                                                     statusDiv.innerText = 'Verification failed. Retrying...';
                                                 }
@@ -433,9 +591,11 @@ object TeraBoxVerification {
                     handler.removeCallbacks(revealRunnable)
                     isDialogShowing.set(false)
                     if (!solved) {
-                        val finalCookies = cookieManager.getCookie(BASE_URL) ?: ""
-                        if (finalCookies.contains("tdl_pass=")) {
-                            finishWithCookies(finalCookies)
+                        val cm1 = cookieManager.getCookie("https://1024teradl.com/") ?: ""
+                        val cm2 = cookieManager.getCookie("https://1024teradl.com") ?: ""
+                        val finalCookies = "$cm1; $cm2"
+                        if (finalCookies.contains("tdl_pass")) {
+                            finishWithVerification(finalCookies, null)
                         } else {
                             latch.countDown()
                         }
@@ -466,6 +626,13 @@ object TeraBoxVerification {
         allowVerification: Boolean = true
     ): List<Tera1024Item> {
         return runCatching {
+            if (!cachedFetchedItems.isNullOrEmpty()) {
+                val items = cachedFetchedItems!!
+                cachedFetchedItems = null
+                Log.d(TAG, "Using pre-fetched items from Turnstile session (${items.size} files)")
+                return@runCatching items
+            }
+
             if (cachedCookies == null) {
                 loadSavedSession()
             }
@@ -493,13 +660,17 @@ object TeraBoxVerification {
 
             var responseText = doRequest(cachedCookies)
 
-            // If challenge required or 403 or empty
             val isChallengeRequired = responseText == null ||
                     responseText.contains("CHALLENGE_REQUIRED") ||
                     responseText.contains("Verification required")
 
             if (isChallengeRequired && allowVerification) {
                 val solved = solveTurnstile(shareUrl)
+                if (!cachedFetchedItems.isNullOrEmpty()) {
+                    val items = cachedFetchedItems!!
+                    cachedFetchedItems = null
+                    return@runCatching items
+                }
                 if (solved && !cachedCookies.isNullOrBlank()) {
                     responseText = doRequest(cachedCookies)
                 }
@@ -507,35 +678,7 @@ object TeraBoxVerification {
 
             if (responseText.isNullOrBlank()) return@runCatching emptyList()
 
-            val json = JSONObject(responseText)
-            val listArr = json.optJSONArray("list") ?: return@runCatching emptyList()
-
-            val results = mutableListOf<Tera1024Item>()
-            for (i in 0 until listArr.length()) {
-                val item = listArr.optJSONObject(i) ?: continue
-                val fsId = item.optString("fs_id").ifBlank { null }
-                val fileName = item.optString("server_filename").ifBlank { item.optString("file_name") }
-                val size = item.optLong("size", 0L)
-                val directLink = item.optString("direct_link").ifBlank { item.optString("dlink") }
-                val streamUrl = item.optString("stream_url").ifBlank { null }
-                val streamDownloadUrl = item.optString("stream_download_url").ifBlank { null }
-                val isDir = item.optInt("isdir", 0) == 1
-                val path = item.optString("path").ifBlank { null }
-
-                results.add(
-                    Tera1024Item(
-                        fsId = fsId,
-                        fileName = fileName,
-                        size = size,
-                        directLink = directLink.ifBlank { null },
-                        streamUrl = streamUrl,
-                        streamDownloadUrl = streamDownloadUrl,
-                        isDir = isDir,
-                        path = path
-                    )
-                )
-            }
-            results
+            parse1024Response(responseText) ?: emptyList()
         }.getOrDefault(emptyList())
     }
 }
