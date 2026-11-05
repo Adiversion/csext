@@ -9,10 +9,15 @@ import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
+import java.io.OutputStream
+import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
+import java.net.URL
 import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
@@ -34,9 +39,16 @@ private data class VariantProbeConfig(
     val qualityVal: Int
 )
 
+data class ProxyConfig(
+    val targetUrl: String,
+    val referer: String? = null,
+    val customHeaders: Map<String, String> = emptyMap()
+)
+
 object LocalM3u8Server {
     private var serverSocket: ServerSocket? = null
     private val playlists = ConcurrentHashMap<String, String>()
+    private val proxies = ConcurrentHashMap<String, ProxyConfig>()
     private val isRunning = AtomicBoolean(false)
 
     val port: Int
@@ -71,34 +83,177 @@ object LocalM3u8Server {
     private fun handleClient(socket: Socket) {
         socket.use { s ->
             try {
-                s.soTimeout = 4000
+                s.soTimeout = 10000
                 val reader = BufferedReader(InputStreamReader(s.getInputStream()))
                 val firstLine = reader.readLine() ?: return
-                // Expected format: GET /master_<id>.m3u8 HTTP/1.1
-                val rawPath = firstLine.split(" ").getOrNull(1) ?: return
+                val parts = firstLine.split(" ")
+                val method = parts.getOrNull(0) ?: "GET"
+                val rawPath = parts.getOrNull(1) ?: return
                 val cleanPath = rawPath.substringBefore("?")
-                val id = cleanPath.substringAfterLast("/").removeSuffix(".m3u8")
-                val content = playlists[cleanPath] ?: playlists[id] ?: playlists["master_$id"] ?: playlists["/master_$id.m3u8"] ?: playlists["$id.m3u8"]
+                val id = cleanPath.substringAfterLast("/").substringBeforeLast(".")
+
+                val clientHeaders = mutableMapOf<String, String>()
+                var headerLine = reader.readLine()
+                while (!headerLine.isNullOrBlank()) {
+                    val colonIdx = headerLine.indexOf(':')
+                    if (colonIdx > 0) {
+                        val k = headerLine.substring(0, colonIdx).trim().lowercase()
+                        val v = headerLine.substring(colonIdx + 1).trim()
+                        clientHeaders[k] = v
+                    }
+                    headerLine = reader.readLine()
+                }
 
                 val out = s.getOutputStream()
-                if (content != null) {
-                    val bytes = content.toByteArray(Charsets.UTF_8)
+
+                // 1. In-memory M3U8 string
+                val m3u8Content = playlists[cleanPath] ?: playlists[id] ?: playlists["master_$id"] ?: playlists["/master_$id.m3u8"] ?: playlists["$id.m3u8"]
+                if (m3u8Content != null) {
+                    val bytes = m3u8Content.toByteArray(Charsets.UTF_8)
                     val response = "HTTP/1.1 200 OK\r\n" +
                             "Content-Type: application/vnd.apple.mpegurl\r\n" +
                             "Content-Length: ${bytes.size}\r\n" +
                             "Connection: close\r\n" +
                             "Access-Control-Allow-Origin: *\r\n\r\n"
                     out.write(response.toByteArray(Charsets.UTF_8))
-                    out.write(bytes)
+                    if (!method.equals("HEAD", ignoreCase = true)) {
+                        out.write(bytes)
+                    }
                     out.flush()
-                } else {
-                    val notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    out.write(notFound.toByteArray(Charsets.UTF_8))
-                    out.flush()
+                    return
                 }
+
+                // 2. Proxied range stream (MKV / MP4 / etc.)
+                val proxyConfig = proxies[cleanPath] ?: proxies[id] ?: proxies[cleanPath.removePrefix("/")] ?: proxies["stream_$id"] ?: proxies["/stream_$id.mkv"]
+                if (proxyConfig != null) {
+                    handleProxyStream(s, method, cleanPath, clientHeaders, proxyConfig, out)
+                    return
+                }
+
+                val notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                out.write(notFound.toByteArray(Charsets.UTF_8))
+                out.flush()
             } catch (_: Exception) {
             }
         }
+    }
+
+    private fun handleProxyStream(
+        socket: Socket,
+        method: String,
+        cleanPath: String,
+        clientHeaders: Map<String, String>,
+        config: ProxyConfig,
+        out: OutputStream
+    ) {
+        var conn: HttpURLConnection? = null
+        try {
+            conn = openConnectionWithRedirects(config.targetUrl, method, clientHeaders, config)
+            val responseCode = conn.responseCode
+            val responseMessage = conn.responseMessage ?: (if (responseCode == 206) "Partial Content" else "OK")
+            val contentType = conn.contentType ?: (if (cleanPath.endsWith(".mp4")) "video/mp4" else "video/x-matroska")
+            val contentRange = conn.getHeaderField("Content-Range")
+            val contentLength = conn.getHeaderField("Content-Length")
+
+            val headerBuilder = StringBuilder()
+            headerBuilder.append("HTTP/1.1 $responseCode $responseMessage\r\n")
+            headerBuilder.append("Content-Type: $contentType\r\n")
+            headerBuilder.append("Accept-Ranges: bytes\r\n")
+            headerBuilder.append("Access-Control-Allow-Origin: *\r\n")
+            headerBuilder.append("Access-Control-Allow-Headers: Range, Accept, Origin, Content-Type\r\n")
+            headerBuilder.append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n")
+            headerBuilder.append("Connection: close\r\n")
+            if (!contentRange.isNullOrBlank()) {
+                headerBuilder.append("Content-Range: $contentRange\r\n")
+            }
+            if (!contentLength.isNullOrBlank()) {
+                headerBuilder.append("Content-Length: $contentLength\r\n")
+            }
+            headerBuilder.append("\r\n")
+
+            out.write(headerBuilder.toString().toByteArray(Charsets.UTF_8))
+            out.flush()
+
+            if (!method.equals("HEAD", ignoreCase = true)) {
+                val inStream = if (responseCode in 200..299) conn.inputStream else conn.errorStream
+                if (inStream != null) {
+                    val buffer = ByteArray(65536)
+                    var bytesRead: Int
+                    try {
+                        socket.soTimeout = 0
+                        while (inStream.read(buffer).also { bytesRead = it } != -1) {
+                            out.write(buffer, 0, bytesRead)
+                        }
+                        out.flush()
+                    } catch (_: SocketException) {
+                    } catch (_: IOException) {
+                    } finally {
+                        runCatching { inStream.close() }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            val errorResponse = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            runCatching { out.write(errorResponse.toByteArray(Charsets.UTF_8)); out.flush() }
+        } finally {
+            runCatching { conn?.disconnect() }
+        }
+    }
+
+    private fun openConnectionWithRedirects(
+        targetUrl: String,
+        method: String,
+        clientHeaders: Map<String, String>,
+        config: ProxyConfig,
+        maxRedirects: Int = 5
+    ): HttpURLConnection {
+        var curUrl = targetUrl
+        var redirectCount = 0
+        while (redirectCount < maxRedirects) {
+            val conn = (URL(curUrl).openConnection() as HttpURLConnection).apply {
+                requestMethod = if (method.equals("HEAD", ignoreCase = true)) "HEAD" else "GET"
+                connectTimeout = 10000
+                readTimeout = 25000
+                instanceFollowRedirects = false
+
+                setRequestProperty("User-Agent", config.customHeaders["User-Agent"] ?: TeraBoxExtractor.USER_AGENT)
+                if (!config.referer.isNullOrBlank()) {
+                    setRequestProperty("Referer", config.referer)
+                }
+                setRequestProperty("Accept", "*/*")
+                setRequestProperty("Accept-Encoding", "identity;q=1, *;q=0")
+                setRequestProperty("Sec-Fetch-Site", "cross-site")
+                setRequestProperty("Sec-Fetch-Mode", "no-cors")
+                setRequestProperty("Sec-Fetch-Dest", "video")
+
+                config.customHeaders.forEach { (k, v) ->
+                    if (!k.equals("User-Agent", ignoreCase = true) && !k.equals("Referer", ignoreCase = true)) {
+                        setRequestProperty(k, v)
+                    }
+                }
+
+                clientHeaders["range"]?.let {
+                    setRequestProperty("Range", it)
+                }
+            }
+
+            val code = conn.responseCode
+            if (code in listOf(HttpURLConnection.HTTP_MOVED_PERM, HttpURLConnection.HTTP_MOVED_TEMP, 307, 308)) {
+                val location = conn.getHeaderField("Location")
+                conn.disconnect()
+                if (!location.isNullOrBlank()) {
+                    curUrl = if (location.startsWith("http://") || location.startsWith("https://")) {
+                        location
+                    } else {
+                        URL(URL(curUrl), location).toString()
+                    }
+                    redirectCount++
+                    continue
+                }
+            }
+            return conn
+        }
+        throw IOException("Too many redirects: $redirectCount")
     }
 
     fun serve(id: String, m3u8Content: String): String {
@@ -116,6 +271,18 @@ object LocalM3u8Server {
         playlists["/$cleanKey.m3u8"] = m3u8Content
         playlists["$cleanKey.m3u8"] = m3u8Content
         return "http://127.0.0.1:$p/$cleanKey.m3u8"
+    }
+
+    fun proxy(id: String, targetUrl: String, referer: String? = null, headers: Map<String, String> = emptyMap()): String {
+        val p = start()
+        val cleanId = id.replace(Regex("[^a-zA-Z0-9_-]"), "_")
+        val config = ProxyConfig(targetUrl, referer, headers)
+        proxies[cleanId] = config
+        proxies["stream_$cleanId"] = config
+        proxies["/stream_$cleanId.mkv"] = config
+        proxies["/stream_$cleanId.mp4"] = config
+        proxies["stream_$cleanId.mkv"] = config
+        return "http://127.0.0.1:$p/stream_$cleanId.mkv"
     }
 
     fun get(key: String): String? {
@@ -745,6 +912,32 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                 // A. Direct worker stream (dl-worker.teraboxdl.site)
                 if (rawUrl.contains("dl-worker.teraboxdl.site")) {
+                    val directStreamId = "tb_direct_" + (targetFsId ?: System.currentTimeMillis().toString())
+                    val proxiedUrl = LocalM3u8Server.proxy(
+                        directStreamId,
+                        rawUrl,
+                        referer = "https://player.1024teradl.com/",
+                        headers = mapOf(
+                            "User-Agent" to USER_AGENT,
+                            "Referer" to "https://player.1024teradl.com/",
+                            "Connection" to "keep-alive"
+                        )
+                    )
+
+                    // 1. Local Proxy Link (Smooth Seeking, external player / casting safe)
+                    callback(
+                        newExtractorLink(
+                            source = "TeraBox Direct 1080p",
+                            name = "TeraBox - Direct HD [1080p] (Local Proxy - Smooth Seeking)",
+                            url = proxiedUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://player.1024teradl.com/"
+                            this.quality = Qualities.P1080.value
+                        }
+                    )
+
+                    // 2. Direct CDN Link (Fallback / External Downloader)
                     callback(
                         newExtractorLink(
                             source = "TeraBox Direct 1080p",
@@ -822,6 +1015,32 @@ open class TeraBoxExtractor : ExtractorApi() {
                     }
 
                     if (!directUrl.isNullOrBlank()) {
+                        val streamId = "tb_1024_" + (targetFsId ?: System.currentTimeMillis().toString())
+                        val proxiedUrl = LocalM3u8Server.proxy(
+                            streamId,
+                            directUrl,
+                            referer = "https://player.1024teradl.com/",
+                            headers = mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to "https://player.1024teradl.com/",
+                                "Connection" to "keep-alive"
+                            )
+                        )
+
+                        // 1. Local Proxy Link (Smooth Seeking, external player / casting safe)
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Direct 1080p",
+                                name = "TeraBox - Direct HD [1080p] (Local Proxy - Smooth Seeking)",
+                                url = proxiedUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://player.1024teradl.com/"
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+
+                        // 2. Direct CDN Link (Fallback / External Downloader)
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Direct 1080p",
@@ -908,6 +1127,30 @@ open class TeraBoxExtractor : ExtractorApi() {
                             is720 -> "720p"
                             else -> "1080p"
                         }
+                        val flowStreamId = "tb_flow_" + (targetFsId ?: System.currentTimeMillis().toString())
+                        val proxiedUrl = LocalM3u8Server.proxy(
+                            flowStreamId,
+                            flowStream.direct1080Url,
+                            referer = "https://flowvideoplayer.com/",
+                            headers = mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to "https://flowvideoplayer.com/",
+                                "Connection" to "keep-alive"
+                            )
+                        )
+                        // Local Proxy Link
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Direct $qualityLabel",
+                                name = "TeraBox - Original [$qualityLabel] (Local Proxy - Smooth Seeking)",
+                                url = proxiedUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://flowvideoplayer.com/"
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        // Direct Worker Link
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Direct $qualityLabel",
