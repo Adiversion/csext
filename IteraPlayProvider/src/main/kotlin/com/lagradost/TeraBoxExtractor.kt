@@ -276,8 +276,17 @@ open class TeraBoxExtractor : ExtractorApi() {
         fun extractSurl(rawUrl: String): String? {
             val clean = runCatching { URLDecoder.decode(rawUrl.trim(), "UTF-8") }.getOrDefault(rawUrl.trim())
             var surl = Regex("""(?:/s/|surl=)([a-zA-Z0-9_\-]+)""").find(clean)?.groupValues?.get(1)
-                ?: if (clean.length in 20..25 && !clean.contains("/") && !clean.contains(".")) clean else null
+                ?: if (clean.length in 20..30 && !clean.contains("/") && !clean.contains(".")) clean else null
                 ?: return null
+
+            // Defensive: if a delimiter like '_' or filename prefix leaked into the surl (e.g. 1ZGGaFIqFNCnCkiaP1Lp6Ow_C)
+            if (surl.contains("_")) {
+                val before = surl.substringBefore("_")
+                if (before.length in 21..24) {
+                    surl = before
+                }
+            }
+
             if (surl.startsWith("1") && surl.length == 23) {
                 surl = surl.substring(1)
             }

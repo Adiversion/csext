@@ -544,8 +544,9 @@ class IteraPlayProvider : MainAPI() {
         val list = catalog?.list ?: return null
         for (item in list) {
             val thumb = item.thumbnail ?: continue
-            val key = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
-                ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
+            val key = Regex("""thumbnails/(1[a-zA-Z0-9\-]{21,23})""").find(thumb)?.groupValues?.get(1)
+                ?: Regex("""thumbnails/([a-zA-Z0-9\-]{21,24})(?:_|\.|\b)""").find(thumb)?.groupValues?.get(1)
+                ?: Regex("""(?:\/s\/|surl=)(1?[a-zA-Z0-9\-]{21,23})""").find(thumb)?.groupValues?.get(1)
             if (!key.isNullOrBlank() && !key.startsWith("thumb_")) {
                 return "https://terabox.app/s/$key"
             }
@@ -557,8 +558,9 @@ class IteraPlayProvider : MainAPI() {
         val id = this.id ?: return null
         val title = this.fileName?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "Video #$id"
         val thumb = this.thumbnail ?: ""
-        val teraboxKey = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
-            ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
+        val teraboxKey = Regex("""thumbnails/(1[a-zA-Z0-9\-]{21,23})""").find(thumb)?.groupValues?.get(1)
+            ?: Regex("""thumbnails/([a-zA-Z0-9\-]{21,24})(?:_|\.|\b)""").find(thumb)?.groupValues?.get(1)
+            ?: Regex("""(?:\/s\/|surl=)(1?[a-zA-Z0-9\-]{21,23})""").find(thumb)?.groupValues?.get(1)
         val teraboxUrl = if (teraboxKey != null && !teraboxKey.startsWith("thumb_")) "https://terabox.app/s/$teraboxKey" else null
 
         val linkData = IteraLinkData(
