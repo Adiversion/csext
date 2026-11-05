@@ -316,20 +316,108 @@ object TeraBoxVerification {
                             return
                         }
 
-                        // Auto-fill and trigger verification if target TeraBox URL is provided
+                        // Auto-fill, dispatch paste event, and mount explicit Turnstile widget
                         val fillUrl = targetTeraUrl ?: "https://terabox.app/s/18YFqJz7G_5zGZqT9s6U-pA"
                         val escapedFillUrl = fillUrl.replace("'", "\\'")
                         val script = """
                             (function() {
-                                if (window.__tb_auto_submitted) return;
-                                window.__tb_auto_submitted = true;
-                                var inp = document.querySelector('input[placeholder*="Terabox"]');
-                                var btn = document.querySelector('button[type="submit"]');
-                                if (inp && btn) {
-                                    inp.value = '$escapedFillUrl';
-                                    inp.dispatchEvent(new Event('input', { bubbles: true }));
-                                    inp.dispatchEvent(new Event('change', { bubbles: true }));
-                                    setTimeout(function() { btn.click(); }, 350);
+                                if (window.__tb_verified_injected) return;
+                                window.__tb_verified_injected = true;
+
+                                // 1. Direct Turnstile Explicit Renderer (Guarantees Turnstile is always visible on screen)
+                                function mountTurnstile() {
+                                    if (document.getElementById('__tb_cf_container')) return;
+                                    var container = document.createElement('div');
+                                    container.id = '__tb_cf_container';
+                                    container.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(18,18,24,0.96);color:#fff;padding:24px;text-align:center;';
+
+                                    var title = document.createElement('h3');
+                                    title.innerText = 'TeraBox 1080p Verification';
+                                    title.style.cssText = 'margin:0 0 8px 0;font-size:18px;color:#fff;font-weight:bold;';
+                                    container.appendChild(title);
+
+                                    var subtitle = document.createElement('p');
+                                    subtitle.innerText = 'Please tap the checkmark below to unlock unthrottled 1080p playback:';
+                                    subtitle.style.cssText = 'margin:0 0 20px 0;font-size:13px;color:#94a3b8;max-width:320px;';
+                                    container.appendChild(subtitle);
+
+                                    var widgetDiv = document.createElement('div');
+                                    widgetDiv.id = '__tb_widget';
+                                    widgetDiv.style.cssText = 'min-height:65px;';
+                                    container.appendChild(widgetDiv);
+
+                                    var statusDiv = document.createElement('div');
+                                    statusDiv.id = '__tb_status';
+                                    statusDiv.innerText = 'Waiting for verification...';
+                                    statusDiv.style.cssText = 'margin-top:16px;font-size:13px;color:#a855f7;font-weight:500;';
+                                    container.appendChild(statusDiv);
+
+                                    document.body.appendChild(container);
+
+                                    if (window.turnstile) {
+                                        try {
+                                            window.turnstile.render('#__tb_widget', {
+                                                sitekey: '0x4AAAAAAFZHusiSezRUKq4-',
+                                                theme: 'dark',
+                                                callback: function(token) {
+                                                    statusDiv.innerText = 'Token verified! Unlocking 1080p stream...';
+                                                    fetch('/api/verify', {
+                                                        method: 'POST',
+                                                        headers: { 'Content-Type': 'application/json' },
+                                                        body: JSON.stringify({ token: token })
+                                                    }).then(function(r) { return r.json(); }).then(function(res) {
+                                                        statusDiv.innerText = 'Success! Closing window...';
+                                                    }).catch(function(err) {
+                                                        statusDiv.innerText = 'Verified! Closing...';
+                                                    });
+                                                },
+                                                'error-callback': function() {
+                                                    statusDiv.innerText = 'Verification failed. Retrying...';
+                                                }
+                                            });
+                                        } catch(e) {
+                                            console.error('Turnstile render error:', e);
+                                        }
+                                    }
+                                }
+
+                                if (window.turnstile) {
+                                    mountTurnstile();
+                                } else {
+                                    var s = document.createElement('script');
+                                    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+                                    s.async = true;
+                                    s.onload = mountTurnstile;
+                                    document.head.appendChild(s);
+                                }
+
+                                // 2. React Input setter + Paste Event Trigger (Backup)
+                                try {
+                                    var inp = document.querySelector('input[placeholder*="Terabox"]');
+                                    var btn = document.querySelector('button[type="submit"]');
+                                    if (inp) {
+                                        var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+                                        if (setter && setter.set) {
+                                            setter.set.call(inp, '$escapedFillUrl');
+                                        } else {
+                                            inp.value = '$escapedFillUrl';
+                                        }
+                                        inp.dispatchEvent(new Event('input', { bubbles: true }));
+                                        inp.dispatchEvent(new Event('change', { bubbles: true }));
+
+                                        try {
+                                            var dt = new DataTransfer();
+                                            dt.setData('text/plain', '$escapedFillUrl');
+                                            var pe = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true });
+                                            inp.dispatchEvent(pe);
+                                        } catch(e) {}
+
+                                        setTimeout(function() {
+                                            if (btn) btn.click();
+                                        }, 300);
+                                    }
+                                } catch(e) {
+                                    console.error('Auto-paste error:', e);
                                 }
                             })();
                         """.trimIndent()
