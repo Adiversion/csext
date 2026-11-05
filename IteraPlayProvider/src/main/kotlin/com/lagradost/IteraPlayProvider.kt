@@ -241,8 +241,8 @@ class IteraPlayProvider : MainAPI() {
                     this.posterUrl = poster
                     this.plot = "TeraBox folder containing ${folderRes.videos.size} episodes."
                 }
-            } else {
-                // If native TeraBox didn't return multiple videos, query FlowVideoPlayer for folder items
+            } else if (folderRes == null || folderRes.videos.isEmpty()) {
+                // Only if native TeraBox failed, query FlowVideoPlayer for folder items
                 val flowVideos = runCatching { TeraBoxExtractor.fetchFlowVideos(teraboxUrl) }.getOrNull() ?: emptyList()
                 if (flowVideos.size > 1) {
                     val episodes = flowVideos.mapIndexed { idx, v ->

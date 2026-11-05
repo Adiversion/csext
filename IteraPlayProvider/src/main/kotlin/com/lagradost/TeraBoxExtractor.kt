@@ -279,7 +279,7 @@ open class TeraBoxExtractor : ExtractorApi() {
             return runCatching {
                 val surl = extractSurl(shareUrl) ?: return@runCatching null
                 val ndus = getSavedNdus()
-                val candidateHosts = listOf("dm.terabox.com", "www.1024terabox.com", "1024tera.com", "terabox.app")
+                val candidateHosts = listOf("www.1024terabox.com", "1024tera.com", "terabox.app")
 
                 for (host in candidateHosts) {
                     val sharePageUrl = "https://$host/sharing/link?surl=$surl"
@@ -288,11 +288,11 @@ open class TeraBoxExtractor : ExtractorApi() {
                         "Cookie" to "ndus=$ndus",
                         "Referer" to sharePageUrl
                     )
-                    val html = runCatching { app.get(sharePageUrl, headers = headers, timeout = 5).text }.getOrNull()
+                    val html = runCatching { app.get(sharePageUrl, headers = headers, timeout = 4).text }.getOrNull()
                     if (html.isNullOrBlank()) continue
 
-                    val tokenMatch = Regex("""fn\(['"]([A-F0-9]{64,128})['"]\)""", RegexOption.IGNORE_CASE).find(html)
-                        ?: Regex("""%22([A-F0-9]{64,128})%22""", RegexOption.IGNORE_CASE).find(html)
+                    val tokenMatch = Regex("""fn\(['"]([A-F0-9]{32,512})['"]\)""", RegexOption.IGNORE_CASE).find(html)
+                        ?: Regex("""%22([A-F0-9]{32,512})%22""", RegexOption.IGNORE_CASE).find(html)
                         ?: Regex("""jsToken["']?\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(html)
                     val jsToken = tokenMatch?.groupValues?.get(1)
 
@@ -370,13 +370,18 @@ open class TeraBoxExtractor : ExtractorApi() {
                         videos.add(initialFile)
                     }
 
+                    val resolvedShareId = shareid ?: rootRes?.shareId?.toString() ?: rootRes?.shareid?.toString()
+                    val resolvedUk = uk ?: rootRes?.uk?.toString()
+                    val resolvedTime = timestamp ?: rootRes?.serverTime?.toString() ?: rootRes?.timestamp?.toString()
+                    val resolvedSign = sign ?: rootRes?.sign
+
                     return@runCatching TeraBoxFolderResult(
                         title = rootRes?.title ?: initialFile?.serverFilename,
                         videos = videos,
-                        uk = uk,
-                        shareid = shareid,
-                        sign = sign,
-                        timestamp = timestamp,
+                        uk = resolvedUk,
+                        shareid = resolvedShareId,
+                        sign = resolvedSign,
+                        timestamp = resolvedTime,
                         jsToken = jsToken,
                         host = host,
                         surl = surl
@@ -418,7 +423,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     "Referer" to "$baseUrl/"
                 )
 
-                val homeRes = app.get(baseUrl, headers = browserHeaders, timeout = 10)
+                val homeRes = app.get(baseUrl, headers = browserHeaders, timeout = 4)
                 val csrfToken = Regex("""name=["']csrf-token["']\s+content=["']([^"']+)["']""").find(homeRes.text)?.groupValues?.get(1)
                     ?: return@runCatching emptyList()
 
@@ -453,7 +458,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                         "browser" to "chrome",
                         "pwa_installed" to false
                     ),
-                    timeout = 10
+                    timeout = 4
                 )
 
                 cookies = extractResponseCookies(initRes, cookies)
@@ -466,10 +471,11 @@ open class TeraBoxExtractor : ExtractorApi() {
                     "$baseUrl/search/video",
                     headers = searchHeaders,
                     json = mapOf("url" to shareUrl),
-                    timeout = 15
+                    timeout = 4
                 )
 
                 val searchJson = runCatching { parseJson<FlowSearchResponse>(searchRes.text) }.getOrNull()
+                if (searchJson?.status == false) return@runCatching emptyList()
                 searchJson?.response ?: emptyList()
             }.getOrDefault(emptyList())
         }
@@ -501,7 +507,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                 )
 
                 // 1. GET /
-                val homeRes = app.get(baseUrl, headers = browserHeaders, timeout = 10)
+                val homeRes = app.get(baseUrl, headers = browserHeaders, timeout = 4)
                 val homeHtml = homeRes.text
                 val csrfToken = Regex("""name=["']csrf-token["']\s+content=["']([^"']+)["']""").find(homeHtml)?.groupValues?.get(1)
                     ?: return@runCatching null
@@ -547,7 +553,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     "$baseUrl/device/init",
                     headers = initHeaders,
                     json = devicePayload,
-                    timeout = 10
+                    timeout = 4
                 )
 
                 cookies = extractResponseCookies(initRes, cookies)
@@ -561,10 +567,11 @@ open class TeraBoxExtractor : ExtractorApi() {
                     "$baseUrl/search/video",
                     headers = searchHeaders,
                     json = mapOf("url" to shareUrl),
-                    timeout = 15
+                    timeout = 4
                 )
 
                 val searchJson = runCatching { parseJson<FlowSearchResponse>(searchRes.text) }.getOrNull()
+                if (searchJson?.status == false) return@runCatching null
                 val vidList = searchJson?.response ?: return@runCatching null
                 if (vidList.isEmpty()) return@runCatching null
 
@@ -628,6 +635,62 @@ open class TeraBoxExtractor : ExtractorApi() {
             }.getOrNull()
         }
 
+        suspend fun resolveGetInDevice(
+            rawUrl: String,
+            targetFsId: String? = null,
+            targetIndex: Int? = null
+        ): String? {
+            return runCatching {
+                val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+                val tokenHeaders = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "application/json, text/plain, */*",
+                    "Accept-Language" to "en-US,en;q=0.9",
+                    "Referer" to "https://getindevice.com/terabox-downloader/",
+                    "Sec-Fetch-Dest" to "empty",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "same-origin"
+                )
+                val tokenRes = app.get(
+                    "https://getindevice.com/api/token/?_t=${System.currentTimeMillis()}",
+                    headers = tokenHeaders,
+                    timeout = 4
+                )
+                val token = parseJson<Map<String, Any>>(tokenRes.text)["token"]?.toString()
+                    ?: return@runCatching null
+
+                val dlHeaders = tokenHeaders.toMutableMap()
+                dlHeaders["Content-Type"] = "application/json"
+                dlHeaders["x-request-token"] = token
+
+                val dlRes = app.post(
+                    "https://getindevice.com/api/download/",
+                    headers = dlHeaders,
+                    json = mapOf(
+                        "url" to rawUrl,
+                        "tool" to "terabox-downloader"
+                    ),
+                    timeout = 6
+                )
+                val dlData = parseJson<Map<String, Any>>(dlRes.text)
+                @Suppress("UNCHECKED_CAST")
+                val videos = dlData["videos"] as? List<Map<String, Any>>
+                if (videos.isNullOrEmpty()) return@runCatching null
+
+                val targetVid = when {
+                    !targetFsId.isNullOrBlank() -> videos.find { 
+                        it["hlsStreamUrl"]?.toString()?.contains("fid=$targetFsId") == true 
+                    } ?: videos.firstOrNull()
+                    targetIndex != null && targetIndex in videos.indices -> videos[targetIndex]
+                    else -> videos.firstOrNull()
+                }
+
+                val remoteHlsUrl = targetVid?.get("hlsStreamUrl")?.toString()
+                if (remoteHlsUrl.isNullOrBlank()) return@runCatching null
+                remoteHlsUrl
+            }.getOrNull()
+        }
+
         suspend fun resolveDirectTeraBox(
             rawUrl: String,
             callback: (ExtractorLink) -> Unit,
@@ -641,27 +704,44 @@ open class TeraBoxExtractor : ExtractorApi() {
                 val streamId = (surl + "_" + (targetFsId ?: targetIndex?.toString() ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
 
                 coroutineScope {
+                    val gidDeferred = async { resolveGetInDevice(rawUrl, targetFsId, targetIndex) }
                     val flowDeferred = async { resolveFlowVideoPlayer(rawUrl, targetFsId, targetPath, targetTitle, targetIndex) }
                     val nativeDeferred = async { runCatching { fetchShareContents(rawUrl) }.getOrNull() }
 
-                    val flowStream = flowDeferred.await()
-
                     var emittedAny = false
 
-                    // Detect exact resolution from fileName
-                    val fNameLower = flowStream?.fileName?.lowercase() ?: ""
-                    val is4k = fNameLower.contains("4k") || fNameLower.contains("2160")
-                    val is720 = fNameLower.contains("720")
-                    val is1080 = fNameLower.contains("1080") || (!is4k && !is720)
-
-                    val (qualityVal, qualityLabel) = when {
-                        is4k -> Qualities.P2160.value to "4K"
-                        is720 -> Qualities.P720.value to "720p"
-                        else -> Qualities.P1080.value to "1080p"
+                    // 1. Emit GetInDevice Unthrottled 1080p HLS Stream First (ultra-fast, unthrottled 10s chunks)
+                    val gidHlsUrl = gidDeferred.await()
+                    if (!gidHlsUrl.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Fast Stream ⚡",
+                                name = "TeraBox - Full HD [1080p] (Fast HLS Stream)",
+                                url = gidHlsUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://getindevice.com/"
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://getindevice.com/"
+                                )
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+                        emittedAny = true
                     }
 
-                    // 1. Emit FlowVideoPlayer Original 1080p/720p Stream IMMEDIATELY (no waiting for native scraping)
+                    // 2. Emit FlowVideoPlayer Original 1080p/720p Stream
+                    val flowStream = flowDeferred.await()
                     if (!flowStream?.direct1080Url.isNullOrBlank()) {
+                        val fNameLower = flowStream.fileName?.lowercase() ?: ""
+                        val is4k = fNameLower.contains("4k") || fNameLower.contains("2160")
+                        val is720 = fNameLower.contains("720")
+                        val (qualityVal, qualityLabel) = when {
+                            is4k -> Qualities.P2160.value to "4K"
+                            is720 -> Qualities.P720.value to "720p"
+                            else -> Qualities.P1080.value to "1080p"
+                        }
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Direct $qualityLabel",
@@ -671,16 +751,15 @@ open class TeraBoxExtractor : ExtractorApi() {
                             ) {
                                 this.headers = mapOf(
                                     "User-Agent" to USER_AGENT,
-                                    "Accept" to "*/*"
+                                    "Accept" to "*/*",
+                                    "Referer" to "https://terabox.app/",
+                                    "Connection" to "keep-alive"
                                 )
                                 this.quality = qualityVal
                             }
                         )
                         emittedAny = true
-                    }
-
-                    // Only emit 480p Fast Stream as absolute fallback if NO 1080p/720p stream could be resolved
-                    if (!emittedAny && !flowStream?.fast720Url.isNullOrBlank()) {
+                    } else if (!emittedAny && !flowStream?.fast720Url.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Fast Stream",
@@ -851,7 +930,13 @@ data class TeraBoxPiniaShareInfo(
 data class TeraBoxShareListResponse(
     @JsonProperty("errno") val errno: Int? = null,
     @JsonProperty("list") val list: List<TeraBoxFileInfo>? = null,
-    @JsonProperty("title") val title: String? = null
+    @JsonProperty("title") val title: String? = null,
+    @JsonProperty("share_id") val shareId: Any? = null,
+    @JsonProperty("shareid") val shareid: Any? = null,
+    @JsonProperty("uk") val uk: Any? = null,
+    @JsonProperty("server_time") val serverTime: Any? = null,
+    @JsonProperty("timestamp") val timestamp: Any? = null,
+    @JsonProperty("sign") val sign: String? = null
 )
 
 data class TeraBoxFileInfo(
