@@ -1,28 +1,28 @@
 Starting a Gradle Daemon (subsequent builds will be faster)
 > Task :AnimePaheProvider:checkKotlinGradlePluginConfigurationErrors SKIPPED
-> Task :WaveFlixProvider:checkKotlinGradlePluginConfigurationErrors SKIPPED
 > Task :IteraPlayProvider:checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :WaveFlixProvider:checkKotlinGradlePluginConfigurationErrors SKIPPED
 > Task :WaveFlixProvider:preBuild UP-TO-DATE
 > Task :AnimePaheProvider:preBuild UP-TO-DATE
 > Task :WaveFlixProvider:preDebugBuild UP-TO-DATE
-> Task :AnimePaheProvider:preDebugBuild UP-TO-DATE
 > Task :IteraPlayProvider:preBuild UP-TO-DATE
 > Task :IteraPlayProvider:preDebugBuild UP-TO-DATE
-> Task :IteraPlayProvider:generateDebugResValues FROM-CACHE
+> Task :AnimePaheProvider:preDebugBuild UP-TO-DATE
 > Task :WaveFlixProvider:generateDebugResValues FROM-CACHE
 > Task :AnimePaheProvider:generateDebugResValues FROM-CACHE
+> Task :IteraPlayProvider:generateDebugResValues FROM-CACHE
 > Task :WaveFlixProvider:generateDebugResources FROM-CACHE
-> Task :IteraPlayProvider:generateDebugResources FROM-CACHE
 > Task :AnimePaheProvider:generateDebugResources FROM-CACHE
-> Task :WaveFlixProvider:packageDebugResources FROM-CACHE
+> Task :IteraPlayProvider:generateDebugResources FROM-CACHE
 > Task :IteraPlayProvider:packageDebugResources FROM-CACHE
 > Task :AnimePaheProvider:packageDebugResources FROM-CACHE
-> Task :WaveFlixProvider:parseDebugLocalResources FROM-CACHE
-> Task :IteraPlayProvider:parseDebugLocalResources FROM-CACHE
+> Task :WaveFlixProvider:packageDebugResources FROM-CACHE
 > Task :AnimePaheProvider:parseDebugLocalResources FROM-CACHE
+> Task :IteraPlayProvider:parseDebugLocalResources FROM-CACHE
+> Task :WaveFlixProvider:parseDebugLocalResources FROM-CACHE
+> Task :AnimePaheProvider:generateDebugRFile FROM-CACHE
 > Task :WaveFlixProvider:generateDebugRFile FROM-CACHE
 > Task :IteraPlayProvider:generateDebugRFile FROM-CACHE
-> Task :AnimePaheProvider:generateDebugRFile FROM-CACHE
 > Task :AnimePaheProvider:compileDebugKotlin FROM-CACHE
 > Task :AnimePaheProvider:compileDex FROM-CACHE
 > Task :AnimePaheProvider:generateManifest FROM-CACHE
@@ -2269,7 +2269,7 @@ Made CloudStream package at /home/runner/work/csext/csext/src/IteraPlayProvider/
 
 > Task :makePluginsJson
 Created /home/runner/work/csext/csext/src/build/plugins.json
-gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/__run-1793858575224.json
+gradle/actions: Writing build results to /home/runner/work/_temp/.gradle-actions/build-results/__run-1793859470437.json
 
-BUILD SUCCESSFUL in 44s
+BUILD SUCCESSFUL in 45s
 31 actionable tasks: 8 executed, 23 from cache
