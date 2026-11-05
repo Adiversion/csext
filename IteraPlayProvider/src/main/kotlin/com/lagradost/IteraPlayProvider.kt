@@ -490,7 +490,7 @@ class IteraPlayProvider : MainAPI() {
                 )
             )
 
-            // 1. Local Proxy Link (Smooth Seeking, external player / casting safe)
+            // Local Proxy Link (Smooth Seeking, external player / casting safe)
             customCallback(
                 newExtractorLink(
                     source = "TeraBox Direct 1080p",
@@ -499,24 +499,6 @@ class IteraPlayProvider : MainAPI() {
                     type = ExtractorLinkType.VIDEO
                 ) {
                     this.referer = "https://player.1024teradl.com/"
-                    this.quality = Qualities.P1080.value
-                }
-            )
-
-            // 2. Direct CDN Link (Fallback / External Downloader)
-            customCallback(
-                newExtractorLink(
-                    source = "TeraBox Direct 1080p",
-                    name = "TeraBox - Direct HD [1080p] (1024TeraDL High-Speed)",
-                    url = linkData.directStreamUrl,
-                    type = ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = "https://player.1024teradl.com/"
-                    this.headers = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Referer" to "https://player.1024teradl.com/",
-                        "Connection" to "keep-alive"
-                    )
                     this.quality = Qualities.P1080.value
                 }
             )

@@ -174,8 +174,30 @@ object LocalM3u8Server {
             out.write(headerBuilder.toString().toByteArray(Charsets.UTF_8))
             out.flush()
 
-            if (!method.equals("HEAD", ignoreCase = true)) {
-                val inStream = if (responseCode in 200..299) conn.inputStream else conn.errorStream
+            if (method.equals("HEAD", ignoreCase = true)) {
+                return
+            }
+
+            // High-speed parallel chunk pipeline for large streaming ranges (> 512 KB)
+            var handledByParallel = false
+            if (responseCode == 206 && !contentRange.isNullOrBlank()) {
+                val rangeMatch = Regex("""bytes\s+(\d+)-(\d+)/(?:\d+|\*)""", RegexOption.IGNORE_CASE).find(contentRange)
+                if (rangeMatch != null) {
+                    val startByte = rangeMatch.groupValues[1].toLongOrNull() ?: 0L
+                    val endByte = rangeMatch.groupValues[2].toLongOrNull() ?: 0L
+                    val bytesToDeliver = endByte - startByte + 1L
+
+                    if (bytesToDeliver > 512 * 1024L) {
+                        conn.disconnect()
+                        conn = null
+                        handleParallelRangeStream(socket, startByte, endByte, clientHeaders, config, out)
+                        handledByParallel = true
+                    }
+                }
+            }
+
+            if (!handledByParallel) {
+                val inStream = if (responseCode in 200..299) conn?.inputStream else conn?.errorStream
                 if (inStream != null) {
                     val buffer = ByteArray(65536)
                     var bytesRead: Int
@@ -197,6 +219,105 @@ object LocalM3u8Server {
             runCatching { out.write(errorResponse.toByteArray(Charsets.UTF_8)); out.flush() }
         } finally {
             runCatching { conn?.disconnect() }
+        }
+    }
+
+    private fun fetchChunk(
+        config: ProxyConfig,
+        clientHeaders: Map<String, String>,
+        chunkStart: Long,
+        chunkEnd: Long
+    ): ByteArray? {
+        for (attempt in 1..2) {
+            var chunkConn: HttpURLConnection? = null
+            try {
+                val headers = clientHeaders.toMutableMap()
+                headers["range"] = "bytes=$chunkStart-$chunkEnd"
+                chunkConn = openConnectionWithRedirects(config.targetUrl, "GET", headers, config)
+                val code = chunkConn.responseCode
+                val stream = if (code in 200..299) chunkConn.inputStream else null
+                if (stream != null) {
+                    val expectedBytes = (chunkEnd - chunkStart + 1L).toInt()
+                    val byteBuf = ByteArray(expectedBytes)
+                    var totalRead = 0
+                    while (totalRead < expectedBytes) {
+                        val r = stream.read(byteBuf, totalRead, expectedBytes - totalRead)
+                        if (r == -1) break
+                        totalRead += r
+                    }
+                    stream.close()
+                    if (totalRead == expectedBytes) {
+                        return byteBuf
+                    } else if (totalRead > 0) {
+                        return byteBuf.copyOf(totalRead)
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { chunkConn?.disconnect() }
+            }
+        }
+        return null
+    }
+
+    private fun handleParallelRangeStream(
+        socket: Socket,
+        startByte: Long,
+        endByte: Long,
+        clientHeaders: Map<String, String>,
+        config: ProxyConfig,
+        out: OutputStream
+    ) {
+        val chunkSize = 384 * 1024L // 384 KB chunks
+        val concurrency = 5 // 5 parallel connections for unthrottled aggregate throughput
+        val totalBytes = endByte - startByte + 1L
+        val totalChunks = ((totalBytes + chunkSize - 1L) / chunkSize).toInt()
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(concurrency) { r ->
+            Thread(r).apply { isDaemon = true }
+        }
+        val futures = ConcurrentHashMap<Int, java.util.concurrent.Future<ByteArray?>>()
+
+        fun scheduleChunk(idx: Int): java.util.concurrent.Future<ByteArray?> {
+            val cStart = startByte + (idx.toLong() * chunkSize)
+            val cEnd = minOf(endByte, cStart + chunkSize - 1L)
+            return pool.submit<ByteArray?> {
+                fetchChunk(config, clientHeaders, cStart, cEnd)
+            }
+        }
+
+        try {
+            socket.soTimeout = 0
+            val initialSeed = minOf(concurrency, totalChunks)
+            for (i in 0 until initialSeed) {
+                futures[i] = scheduleChunk(i)
+            }
+
+            for (i in 0 until totalChunks) {
+                val nextIdx = i + concurrency
+                if (nextIdx < totalChunks) {
+                    futures[nextIdx] = scheduleChunk(nextIdx)
+                }
+
+                val future = futures.remove(i)
+                val chunkData = runCatching { future?.get(25, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull()
+                if (chunkData != null && chunkData.isNotEmpty()) {
+                    out.write(chunkData)
+                    out.flush()
+                } else {
+                    val cStart = startByte + (i.toLong() * chunkSize)
+                    val cEnd = minOf(endByte, cStart + chunkSize - 1L)
+                    val fallback = fetchChunk(config, clientHeaders, cStart, cEnd)
+                    if (fallback != null && fallback.isNotEmpty()) {
+                        out.write(fallback)
+                        out.flush()
+                    }
+                }
+            }
+        } catch (_: SocketException) {
+            // Client closed connection / seeked
+        } catch (_: IOException) {
+        } finally {
+            pool.shutdownNow()
         }
     }
 
@@ -924,7 +1045,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                         )
                     )
 
-                    // 1. Local Proxy Link (Smooth Seeking, external player / casting safe)
+                    // Local Proxy Link (Smooth Seeking, external player / casting safe)
                     callback(
                         newExtractorLink(
                             source = "TeraBox Direct 1080p",
@@ -933,24 +1054,6 @@ open class TeraBoxExtractor : ExtractorApi() {
                             type = ExtractorLinkType.VIDEO
                         ) {
                             this.referer = "https://player.1024teradl.com/"
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-
-                    // 2. Direct CDN Link (Fallback / External Downloader)
-                    callback(
-                        newExtractorLink(
-                            source = "TeraBox Direct 1080p",
-                            name = "TeraBox - Direct HD [1080p] (1024TeraDL High-Speed)",
-                            url = rawUrl,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = "https://player.1024teradl.com/"
-                            this.headers = mapOf(
-                                "User-Agent" to USER_AGENT,
-                                "Referer" to "https://player.1024teradl.com/",
-                                "Connection" to "keep-alive"
-                            )
                             this.quality = Qualities.P1080.value
                         }
                     )
@@ -1027,7 +1130,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                             )
                         )
 
-                        // 1. Local Proxy Link (Smooth Seeking, external player / casting safe)
+                        // Local Proxy Link (Smooth Seeking, external player / casting safe)
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Direct 1080p",
@@ -1036,24 +1139,6 @@ open class TeraBoxExtractor : ExtractorApi() {
                                 type = ExtractorLinkType.VIDEO
                             ) {
                                 this.referer = "https://player.1024teradl.com/"
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-
-                        // 2. Direct CDN Link (Fallback / External Downloader)
-                        callback(
-                            newExtractorLink(
-                                source = "TeraBox Direct 1080p",
-                                name = "TeraBox - Direct HD [1080p] (1024TeraDL High-Speed)",
-                                url = directUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = "https://player.1024teradl.com/"
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer" to "https://player.1024teradl.com/",
-                                    "Connection" to "keep-alive"
-                                )
                                 this.quality = Qualities.P1080.value
                             }
                         )
@@ -1138,33 +1223,16 @@ open class TeraBoxExtractor : ExtractorApi() {
                                 "Connection" to "keep-alive"
                             )
                         )
-                        // Local Proxy Link
+                        // Accelerated Local Proxy Link (Smooth Seeking + 5-Connection Multi-Thread Range Pipe)
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Direct $qualityLabel",
-                                name = "TeraBox - Original [$qualityLabel] (Local Proxy - Smooth Seeking)",
+                                name = "TeraBox - Original [$qualityLabel] (Local Proxy - Accelerated Playback)",
                                 url = proxiedUrl,
                                 type = ExtractorLinkType.VIDEO
                             ) {
                                 this.referer = "https://flowvideoplayer.com/"
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        // Direct Worker Link
-                        callback(
-                            newExtractorLink(
-                                source = "TeraBox Direct $qualityLabel",
-                                name = "TeraBox - Original [$qualityLabel] (Worker Direct - ⚠️ Buffers @ 150KB/s)",
-                                url = flowStream.direct1080Url,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Accept" to "*/*",
-                                    "Referer" to "https://flowvideoplayer.com/",
-                                    "Connection" to "keep-alive"
-                                )
-                                this.quality = Qualities.Unknown.value
+                                this.quality = if (qualityLabel == "1080p") Qualities.P1080.value else if (qualityLabel == "720p") Qualities.P720.value else Qualities.Unknown.value
                             }
                         )
                         emittedAny = true
