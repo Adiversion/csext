@@ -268,8 +268,8 @@ object LocalM3u8Server {
         config: ProxyConfig,
         out: OutputStream
     ) {
-        val chunkSize = 384 * 1024L // 384 KB chunks
-        val concurrency = 5 // 5 parallel connections for unthrottled aggregate throughput
+        val chunkSize = 256 * 1024L // 256 KB chunks for smooth instant lookahead
+        val concurrency = 10 // 10 parallel connections for sustained >= 1.0 MB/s playback throughput
         val totalBytes = endByte - startByte + 1L
         val totalChunks = ((totalBytes + chunkSize - 1L) / chunkSize).toInt()
         val pool = java.util.concurrent.Executors.newFixedThreadPool(concurrency) { r ->
