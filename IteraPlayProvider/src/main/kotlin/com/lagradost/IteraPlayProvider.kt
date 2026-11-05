@@ -11,6 +11,7 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import java.net.URLDecoder
 import java.net.URLEncoder
 
 class IteraPlayProvider : MainAPI() {
@@ -130,19 +131,48 @@ class IteraPlayProvider : MainAPI() {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
 
-        // 1. Direct TeraBox Link Handling:
-        if (cleanQuery.contains("terabox") || cleanQuery.contains("1024tera")) {
+        // 1. Direct TeraBox / TeraDL Link Handling:
+        if (cleanQuery.contains("terabox") || cleanQuery.contains("1024tera") || cleanQuery.contains("teradl") || cleanQuery.contains("teraboxdl")) {
+            var filename: String? = null
+            var poster: String? = null
+            var directStream: String? = null
+            var hlsStream: String? = null
+            var teraboxShareUrl: String? = null
+
+            if (cleanQuery.contains("?")) {
+                val queryPart = cleanQuery.substringAfter("?")
+                for (param in queryPart.split("&")) {
+                    val key = param.substringBefore("=")
+                    val rawVal = param.substringAfter("=", "")
+                    val decodedVal = runCatching { URLDecoder.decode(rawVal, "UTF-8") }.getOrDefault(rawVal)
+                    when (key) {
+                        "filename" -> filename = decodedVal
+                        "poster" -> poster = decodedVal
+                        "direct" -> directStream = decodedVal
+                        "start" -> hlsStream = decodedVal
+                        "terabox_url" -> teraboxShareUrl = decodedVal
+                    }
+                }
+            }
+
+            val title = filename?.removeSuffix(".mp4")?.removeSuffix(".mkv")?.replace("_", " ")?.trim()
+                ?: if (cleanQuery.contains("/")) cleanQuery.substringAfterLast("/").substringBefore("?").ifEmpty { "Direct TeraBox Stream" } else "Direct TeraBox Stream"
+            val displayPoster = poster ?: "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
+
             val directLinkData = IteraLinkData(
-                teraboxUrl = cleanQuery,
-                title = "Direct TeraBox Stream"
+                teraboxUrl = teraboxShareUrl ?: cleanQuery,
+                title = title,
+                poster = displayPoster,
+                directStreamUrl = directStream,
+                hlsStreamUrl = hlsStream
             )
             return listOf(
                 newMovieSearchResponse(
-                    name = "TeraBox: ${cleanQuery.substringAfterLast("/")}",
+                    name = title,
                     url = directLinkData.toJson(),
                     type = TvType.Movie
                 ) {
-                    this.posterUrl = "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
+                    this.posterUrl = displayPoster
                 }
             )
         }
@@ -202,13 +232,44 @@ class IteraPlayProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val linkData = if (url.startsWith("{") && url.endsWith("}")) {
             runCatching { parseJson<IteraLinkData>(url) }.getOrNull()
-        } else if (url.contains("terabox") || url.contains("1024tera")) {
-            IteraLinkData(teraboxUrl = url, title = "Direct TeraBox Stream")
+        } else if (url.contains("terabox") || url.contains("1024tera") || url.contains("teradl") || url.contains("teraboxdl")) {
+            var filename: String? = null
+            var poster: String? = null
+            var directStream: String? = null
+            var hlsStream: String? = null
+            var teraboxShareUrl: String? = null
+
+            if (url.contains("?")) {
+                val queryPart = url.substringAfter("?")
+                for (param in queryPart.split("&")) {
+                    val key = param.substringBefore("=")
+                    val rawVal = param.substringAfter("=", "")
+                    val decodedVal = runCatching { URLDecoder.decode(rawVal, "UTF-8") }.getOrDefault(rawVal)
+                    when (key) {
+                        "filename" -> filename = decodedVal
+                        "poster" -> poster = decodedVal
+                        "direct" -> directStream = decodedVal
+                        "start" -> hlsStream = decodedVal
+                        "terabox_url" -> teraboxShareUrl = decodedVal
+                    }
+                }
+            }
+            val title = filename?.removeSuffix(".mp4")?.removeSuffix(".mkv")?.replace("_", " ")?.trim()
+                ?: if (url.contains("/")) url.substringAfterLast("/").substringBefore("?").ifEmpty { "Direct TeraBox Stream" } else "Direct TeraBox Stream"
+            val displayPoster = poster ?: "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png"
+
+            IteraLinkData(
+                teraboxUrl = teraboxShareUrl ?: url,
+                title = title,
+                poster = displayPoster,
+                directStreamUrl = directStream,
+                hlsStreamUrl = hlsStream
+            )
         } else null
 
         val videoId = linkData?.videoId
             ?: Regex("""/video/(\d+)""").find(url)?.groupValues?.get(1)?.toLongOrNull()
-            ?: (if (!linkData?.teraboxUrl.isNullOrBlank()) 0L else throw ErrorLoadingException("Invalid video URL: $url"))
+            ?: (if (!linkData?.teraboxUrl.isNullOrBlank() || !linkData?.directStreamUrl.isNullOrBlank() || !linkData?.hlsStreamUrl.isNullOrBlank()) 0L else throw ErrorLoadingException("Invalid video URL: $url"))
 
         var teraboxUrl = linkData?.teraboxUrl
         val title = linkData?.title ?: "Video #$videoId"
@@ -256,7 +317,9 @@ class IteraPlayProvider : MainAPI() {
             videoId = videoId,
             teraboxUrl = teraboxUrl,
             title = title,
-            poster = poster
+            poster = poster,
+            directStreamUrl = linkData?.directStreamUrl,
+            hlsStreamUrl = linkData?.hlsStreamUrl
         )
 
         if (!teraboxUrl.isNullOrBlank()) {
@@ -389,30 +452,66 @@ class IteraPlayProvider : MainAPI() {
             }
         }
 
-        if (teraboxUrl.isNullOrBlank() || teraboxUrl.contains("thumb_")) {
-            return false
-        }
-
         var foundLinks = false
         val customCallback: (ExtractorLink) -> Unit = { link ->
             foundLinks = true
             callback(link)
         }
 
-        runCatching {
-            TeraBoxExtractor.resolveDirectTeraBox(
-                teraboxUrl,
-                customCallback,
-                targetFsId = linkData.fsId,
-                targetPath = linkData.filePath,
-                targetTitle = linkData.title,
-                targetIndex = linkData.episodeIndex
+        // 0. If directStreamUrl or hlsStreamUrl were parsed from player.1024teradl.com or search:
+        if (!linkData.hlsStreamUrl.isNullOrBlank()) {
+            customCallback(
+                newExtractorLink(
+                    source = "TeraBox Fast Stream ⚡",
+                    name = "TeraBox - Fast Stream ⚡ [480p] (1024TeraDL)",
+                    url = linkData.hlsStreamUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://player.1024teradl.com/"
+                    this.headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to "https://player.1024teradl.com/"
+                    )
+                    this.quality = Qualities.P480.value
+                }
             )
         }
 
-        if (!foundLinks) {
+        if (!linkData.directStreamUrl.isNullOrBlank()) {
+            customCallback(
+                newExtractorLink(
+                    source = "TeraBox Direct 1080p",
+                    name = "TeraBox - Direct HD [1080p] (1024TeraDL High-Speed)",
+                    url = linkData.directStreamUrl,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = "https://player.1024teradl.com/"
+                    this.headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to "https://player.1024teradl.com/",
+                        "Connection" to "keep-alive"
+                    )
+                    this.quality = Qualities.P1080.value
+                }
+            )
+        }
+
+        if (!teraboxUrl.isNullOrBlank() && !teraboxUrl.contains("thumb_")) {
             runCatching {
-                loadExtractor(teraboxUrl, subtitleCallback, customCallback)
+                TeraBoxExtractor.resolveDirectTeraBox(
+                    teraboxUrl,
+                    customCallback,
+                    targetFsId = linkData.fsId,
+                    targetPath = linkData.filePath,
+                    targetTitle = linkData.title,
+                    targetIndex = linkData.episodeIndex
+                )
+            }
+
+            if (!foundLinks) {
+                runCatching {
+                    loadExtractor(teraboxUrl, subtitleCallback, customCallback)
+                }
             }
         }
 
@@ -573,5 +672,7 @@ data class IteraLinkData(
     val poster: String? = null,
     val fsId: String? = null,
     val filePath: String? = null,
-    val episodeIndex: Int? = null
+    val episodeIndex: Int? = null,
+    val directStreamUrl: String? = null,
+    val hlsStreamUrl: String? = null
 )

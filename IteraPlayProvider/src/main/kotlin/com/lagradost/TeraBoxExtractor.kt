@@ -274,7 +274,7 @@ open class TeraBoxExtractor : ExtractorApi() {
         private const val CACHE_TTL_MS = 10 * 60 * 1000L // 10 minutes
 
         fun extractSurl(rawUrl: String): String? {
-            val clean = rawUrl.trim()
+            val clean = runCatching { URLDecoder.decode(rawUrl.trim(), "UTF-8") }.getOrDefault(rawUrl.trim())
             var surl = Regex("""(?:/s/|surl=)([a-zA-Z0-9_\-]+)""").find(clean)?.groupValues?.get(1)
                 ?: if (clean.length in 20..25 && !clean.contains("/") && !clean.contains(".")) clean else null
                 ?: return null
@@ -732,15 +732,118 @@ open class TeraBoxExtractor : ExtractorApi() {
             targetIndex: Int? = null
         ): Boolean {
             return runCatching {
-                val surl = extractSurl(rawUrl) ?: return false
+                var emittedAny = false
+
+                // A. Direct worker stream (dl-worker.teraboxdl.site)
+                if (rawUrl.contains("dl-worker.teraboxdl.site")) {
+                    callback(
+                        newExtractorLink(
+                            source = "TeraBox Direct 1080p",
+                            name = "TeraBox - Direct HD [1080p] (1024TeraDL High-Speed)",
+                            url = rawUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://player.1024teradl.com/"
+                            this.headers = mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to "https://player.1024teradl.com/",
+                                "Connection" to "keep-alive"
+                            )
+                            this.quality = Qualities.P1080.value
+                        }
+                    )
+                    emittedAny = true
+                }
+
+                // B. Fast preview HLS stream (get_m3u8_stream_fast)
+                if (rawUrl.contains("get_m3u8_stream_fast")) {
+                    callback(
+                        newExtractorLink(
+                            source = "TeraBox Fast Stream ⚡",
+                            name = "TeraBox - Fast Stream ⚡ [480p] (1024TeraDL)",
+                            url = rawUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "https://player.1024teradl.com/"
+                            this.headers = mapOf(
+                                "User-Agent" to USER_AGENT,
+                                "Referer" to "https://player.1024teradl.com/"
+                            )
+                            this.quality = Qualities.P480.value
+                        }
+                    )
+                    emittedAny = true
+                }
+
+                // C. Player URL containing start, direct, and/or terabox_url query parameters
+                var effectiveUrl = rawUrl
+                if (rawUrl.contains("player.1024teradl.com") || (rawUrl.contains("start=") && rawUrl.contains("direct="))) {
+                    val queryPart = rawUrl.substringAfter("?")
+                    var directUrl: String? = null
+                    var startUrl: String? = null
+                    var embeddedTeraboxUrl: String? = null
+                    for (param in queryPart.split("&")) {
+                        val key = param.substringBefore("=")
+                        val rawVal = param.substringAfter("=", "")
+                        val decodedVal = runCatching { URLDecoder.decode(rawVal, "UTF-8") }.getOrDefault(rawVal)
+                        when (key) {
+                            "direct" -> directUrl = decodedVal
+                            "start" -> startUrl = decodedVal
+                            "terabox_url" -> embeddedTeraboxUrl = decodedVal
+                        }
+                    }
+
+                    if (!startUrl.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Fast Stream ⚡",
+                                name = "TeraBox - Fast Stream ⚡ [480p] (1024TeraDL)",
+                                url = startUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://player.1024teradl.com/"
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://player.1024teradl.com/"
+                                )
+                                this.quality = Qualities.P480.value
+                            }
+                        )
+                        emittedAny = true
+                    }
+
+                    if (!directUrl.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Direct 1080p",
+                                name = "TeraBox - Direct HD [1080p] (1024TeraDL High-Speed)",
+                                url = directUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://player.1024teradl.com/"
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://player.1024teradl.com/",
+                                    "Connection" to "keep-alive"
+                                )
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+                        emittedAny = true
+                    }
+
+                    if (!embeddedTeraboxUrl.isNullOrBlank()) {
+                        effectiveUrl = embeddedTeraboxUrl
+                    }
+                }
+
+                val surl = extractSurl(effectiveUrl) ?: return@runCatching emittedAny
                 val streamId = (surl + "_" + (targetFsId ?: targetIndex?.toString() ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
 
                 coroutineScope {
-                    val gidDeferred = async { resolveGetInDevice(rawUrl, targetFsId, targetIndex) }
-                    val flowDeferred = async { resolveFlowVideoPlayer(rawUrl, targetFsId, targetPath, targetTitle, targetIndex) }
-                    val nativeDeferred = async { runCatching { fetchShareContents(rawUrl) }.getOrNull() }
-
-                    var emittedAny = false
+                    val gidDeferred = async { resolveGetInDevice(effectiveUrl, targetFsId, targetIndex) }
+                    val flowDeferred = async { resolveFlowVideoPlayer(effectiveUrl, targetFsId, targetPath, targetTitle, targetIndex) }
+                    val nativeDeferred = async { runCatching { fetchShareContents(effectiveUrl) }.getOrNull() }
 
                     // 1. Emit GetInDevice Unthrottled HLS Stream FIRST (Smooth, instant seeking, zero buffer)
                     val gidHlsUrl = gidDeferred.await()
@@ -946,6 +1049,14 @@ class TeraBox1024BoxExtractor : TeraBoxExtractor() {
 
 class TeraBoxLinkExtractor : TeraBoxExtractor() {
     override val mainUrl = "https://teraboxlink.com"
+}
+
+class TeraBox1024DlExtractor : TeraBoxExtractor() {
+    override val mainUrl = "https://1024teradl.com"
+}
+
+class TeraBoxDlSiteExtractor : TeraBoxExtractor() {
+    override val mainUrl = "https://teraboxdl.site"
 }
 
 data class TeraBoxInitialState(
