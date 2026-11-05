@@ -268,7 +268,10 @@ open class TeraBoxExtractor : ExtractorApi() {
         }
 
         fun extractSurl(rawUrl: String): String? {
-            var surl = Regex("""(?:/s/|surl=)([a-zA-Z0-9_\-]+)""").find(rawUrl)?.groupValues?.get(1) ?: return null
+            val clean = rawUrl.trim()
+            var surl = Regex("""(?:/s/|surl=)([a-zA-Z0-9_\-]+)""").find(clean)?.groupValues?.get(1)
+                ?: if (clean.length in 20..25 && !clean.contains("/") && !clean.contains(".")) clean else null
+                ?: return null
             if (surl.startsWith("1") && surl.length == 23) {
                 surl = surl.substring(1)
             }
@@ -710,28 +713,7 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                     var emittedAny = false
 
-                    // 1. Emit GetInDevice Unthrottled 1080p HLS Stream First (ultra-fast, unthrottled 10s chunks)
-                    val gidHlsUrl = gidDeferred.await()
-                    if (!gidHlsUrl.isNullOrBlank()) {
-                        callback(
-                            newExtractorLink(
-                                source = "TeraBox Fast Stream ⚡",
-                                name = "TeraBox - Full HD [1080p] (Fast HLS Stream)",
-                                url = gidHlsUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = "https://getindevice.com/"
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer" to "https://getindevice.com/"
-                                )
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-                        emittedAny = true
-                    }
-
-                    // 2. Emit FlowVideoPlayer Original 1080p/720p Stream
+                    // 1. Emit FlowVideoPlayer Original 1080p/720p Direct Stream FIRST
                     val flowStream = flowDeferred.await()
                     if (!flowStream?.direct1080Url.isNullOrBlank()) {
                         val fNameLower = flowStream.fileName?.lowercase() ?: ""
@@ -759,15 +741,42 @@ open class TeraBoxExtractor : ExtractorApi() {
                             }
                         )
                         emittedAny = true
-                    } else if (!emittedAny && !flowStream?.fast720Url.isNullOrBlank()) {
+                    }
+
+                    if (!flowStream?.fast720Url.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Fast Stream",
-                                name = "TeraBox - Fast Stream ⚡ [480p] (Direct Stream)",
+                                name = "TeraBox - Fast Stream [720p] (Flow Stream)",
                                 url = flowStream.fast720Url,
                                 type = ExtractorLinkType.M3U8
                             ) {
                                 this.referer = "https://flowvideoplayer.com/"
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://flowvideoplayer.com/"
+                                )
+                                this.quality = Qualities.P720.value
+                            }
+                        )
+                        emittedAny = true
+                    }
+
+                    // 2. Emit GetInDevice Unthrottled HLS Stream (Accurately labeled 480p preview transcode)
+                    val gidHlsUrl = gidDeferred.await()
+                    if (!gidHlsUrl.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Fast Stream ⚡",
+                                name = "TeraBox - Fast Stream ⚡ [480p] (Smooth Seek)",
+                                url = gidHlsUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://getindevice.com/"
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://getindevice.com/"
+                                )
                                 this.quality = Qualities.P480.value
                             }
                         )

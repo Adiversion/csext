@@ -156,10 +156,13 @@ class IteraPlayProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val linkData = if (url.startsWith("{") && url.endsWith("}")) {
             runCatching { parseJson<IteraLinkData>(url) }.getOrNull()
+        } else if (url.contains("terabox") || url.contains("1024tera")) {
+            IteraLinkData(teraboxUrl = url, title = "Direct TeraBox Stream")
         } else null
 
-        val videoId = linkData?.videoId ?: Regex("""/video/(\d+)""").find(url)?.groupValues?.get(1)?.toLongOrNull()
-            ?: throw ErrorLoadingException("Invalid video URL: $url")
+        val videoId = linkData?.videoId
+            ?: Regex("""/video/(\d+)""").find(url)?.groupValues?.get(1)?.toLongOrNull()
+            ?: (if (!linkData?.teraboxUrl.isNullOrBlank()) 0L else throw ErrorLoadingException("Invalid video URL: $url"))
 
         var teraboxUrl = linkData?.teraboxUrl
         val title = linkData?.title ?: "Video #$videoId"
@@ -396,8 +399,8 @@ class IteraPlayProvider : MainAPI() {
         val list = catalog?.list ?: return null
         for (item in list) {
             val thumb = item.thumbnail ?: continue
-            val key = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
-                ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
+            val key = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
+                ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
             if (!key.isNullOrBlank() && !key.startsWith("thumb_")) {
                 return "https://terabox.app/s/$key"
             }
@@ -409,8 +412,8 @@ class IteraPlayProvider : MainAPI() {
         val id = this.id ?: return null
         val title = this.fileName?.removeSuffix(".mp4")?.replace("_", " ")?.trim() ?: "Video #$id"
         val thumb = this.thumbnail ?: ""
-        val teraboxKey = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
-            ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{22})""").find(thumb)?.groupValues?.get(1)
+        val teraboxKey = Regex("""thumbnails/(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
+            ?: Regex("""(?:\/s\/|surl=)(1[a-zA-Z0-9_\-]{20,24})""").find(thumb)?.groupValues?.get(1)
         val teraboxUrl = if (teraboxKey != null && !teraboxKey.startsWith("thumb_")) "https://terabox.app/s/$teraboxKey" else null
 
         val linkData = IteraLinkData(
@@ -457,7 +460,21 @@ class IteraPlayProvider : MainAPI() {
                         .build()
                 }
             }
-            if (url.contains("terabox") || url.contains("1024tera") || extractorLink.source.contains("TeraBox")) {
+            if (url.contains("getindevice.com")) {
+                val reqBuilder = request.newBuilder()
+                reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
+                reqBuilder.header("Referer", "https://getindevice.com/")
+                reqBuilder.header("Accept", "*/*")
+                return@Interceptor chain.proceed(reqBuilder.build())
+            }
+            if (url.contains("flowvideoplayer.com")) {
+                val reqBuilder = request.newBuilder()
+                reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
+                reqBuilder.header("Referer", "https://flowvideoplayer.com/")
+                reqBuilder.header("Accept", "*/*")
+                return@Interceptor chain.proceed(reqBuilder.build())
+            }
+            if (url.contains("terabox") || url.contains("1024tera")) {
                 val reqBuilder = request.newBuilder()
                 reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
                 reqBuilder.header("Referer", "https://www.1024terabox.com/")
@@ -466,7 +483,7 @@ class IteraPlayProvider : MainAPI() {
                 if (!ndus.isNullOrBlank()) {
                     reqBuilder.header("Cookie", "ndus=$ndus")
                 }
-                chain.proceed(reqBuilder.build())
+                return@Interceptor chain.proceed(reqBuilder.build())
             } else {
                 chain.proceed(request)
             }
