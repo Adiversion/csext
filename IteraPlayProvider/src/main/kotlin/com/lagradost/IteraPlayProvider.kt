@@ -354,7 +354,7 @@ class IteraPlayProvider : MainAPI() {
                     this.plot = "TeraBox folder containing ${folderRes.videos.size} episodes."
                 }
             } else if (folderRes == null || folderRes.videos.isEmpty()) {
-                // Only if native TeraBox failed, query FlowVideoPlayer for folder items
+                // Query FlowVideoPlayer for folder items
                 val flowVideos = runCatching { TeraBoxExtractor.fetchFlowVideos(teraboxUrl) }.getOrNull() ?: emptyList()
                 if (flowVideos.size > 1) {
                     val episodes = flowVideos.mapIndexed { idx, v ->
@@ -383,6 +383,42 @@ class IteraPlayProvider : MainAPI() {
                     ) {
                         this.posterUrl = poster
                         this.plot = "TeraBox folder containing ${flowVideos.size} episodes."
+                    }
+                } else if (flowVideos.isEmpty()) {
+                    // Query 1024TeraDL for multi-episode folder items
+                    val teradlVideos = runCatching {
+                        TeraBoxVerification.fetch1024Files(teraboxUrl, allowVerification = false)
+                    }.getOrNull()?.filter { !it.isDir } ?: emptyList()
+
+                    if (teradlVideos.size > 1) {
+                        val episodes = teradlVideos.mapIndexed { idx, v ->
+                            val epTitle = v.fileName?.removeSuffix(".mp4")?.removeSuffix(".mkv")?.replace("_", " ")?.trim()
+                                ?: "Episode ${idx + 1}"
+                            val epData = IteraLinkData(
+                                videoId = videoId,
+                                teraboxUrl = teraboxUrl,
+                                title = epTitle,
+                                poster = poster,
+                                fsId = v.fsId,
+                                filePath = v.path,
+                                episodeIndex = idx
+                            )
+                            newEpisode(epData.toJson()) {
+                                this.name = epTitle
+                                this.episode = idx + 1
+                                this.posterUrl = poster
+                            }
+                        }
+
+                        return newTvSeriesLoadResponse(
+                            name = title,
+                            url = url,
+                            type = TvType.TvSeries,
+                            episodes = episodes
+                        ) {
+                            this.posterUrl = poster
+                            this.plot = "TeraBox folder containing ${teradlVideos.size} episodes."
+                        }
                     }
                 }
             }

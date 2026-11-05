@@ -1154,11 +1154,78 @@ open class TeraBoxExtractor : ExtractorApi() {
                 val streamId = (surl + "_" + (targetFsId ?: targetIndex?.toString() ?: "0")).replace(Regex("[^a-zA-Z0-9_-]"), "")
 
                 coroutineScope {
+                    val teradlDeferred = async {
+                        runCatching {
+                            TeraBoxVerification.fetch1024Files(effectiveUrl, allowVerification = true)
+                        }.getOrNull() ?: emptyList()
+                    }
                     val gidDeferred = async { resolveGetInDevice(effectiveUrl, targetFsId, targetIndex) }
                     val flowDeferred = async { resolveFlowVideoPlayer(effectiveUrl, targetFsId, targetPath, targetTitle, targetIndex) }
                     val nativeDeferred = async { runCatching { fetchShareContents(effectiveUrl) }.getOrNull() }
 
-                    // 1. Emit GetInDevice Unthrottled HLS Stream FIRST (Smooth, instant seeking, zero buffer)
+                    // 1. Emit Unthrottled 1080p Stream from 1024TeraDL (dl-worker.teraboxdl.site)
+                    val teradlFiles = teradlDeferred.await()
+                    val targetTeraFile = if (teradlFiles.isNotEmpty()) {
+                        if (!targetFsId.isNullOrBlank()) {
+                            teradlFiles.firstOrNull { it.fsId == targetFsId }
+                        } else if (targetIndex != null && targetIndex in 0 until teradlFiles.size) {
+                            teradlFiles[targetIndex]
+                        } else {
+                            teradlFiles.firstOrNull { !it.isDir }
+                        }
+                    } else null
+
+                    if (targetTeraFile != null) {
+                        val highSpeedDirect = targetTeraFile.directLink ?: targetTeraFile.streamDownloadUrl
+                        if (!highSpeedDirect.isNullOrBlank()) {
+                            val directStreamId = "tb_direct_" + (targetTeraFile.fsId ?: targetFsId ?: System.currentTimeMillis().toString())
+                            val proxiedUrl = LocalM3u8Server.proxy(
+                                directStreamId,
+                                highSpeedDirect,
+                                referer = "https://player.1024teradl.com/",
+                                headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://player.1024teradl.com/",
+                                    "Connection" to "keep-alive"
+                                )
+                            )
+
+                            callback(
+                                newExtractorLink(
+                                    source = "TeraBox Direct 1080p",
+                                    name = "TeraBox - Direct HD [1080p] (Local Proxy - Smooth Seeking)",
+                                    url = proxiedUrl,
+                                    type = ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = "https://player.1024teradl.com/"
+                                    this.quality = Qualities.P1080.value
+                                }
+                            )
+                            emittedAny = true
+                        }
+
+                        val fastHls = targetTeraFile.streamUrl
+                        if (!fastHls.isNullOrBlank()) {
+                            callback(
+                                newExtractorLink(
+                                    source = "TeraBox Fast Stream ⚡",
+                                    name = "TeraBox - Fast Stream ⚡ [480p] (1024TeraDL)",
+                                    url = fastHls,
+                                    type = ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = "https://player.1024teradl.com/"
+                                    this.headers = mapOf(
+                                        "User-Agent" to USER_AGENT,
+                                        "Referer" to "https://player.1024teradl.com/"
+                                    )
+                                    this.quality = Qualities.P480.value
+                                }
+                            )
+                            emittedAny = true
+                        }
+                    }
+
+                    // 2. Emit GetInDevice Unthrottled HLS Stream FIRST (Smooth, instant seeking, zero buffer)
                     val gidHlsUrl = gidDeferred.await()
                     if (!gidHlsUrl.isNullOrBlank()) {
                         callback(
