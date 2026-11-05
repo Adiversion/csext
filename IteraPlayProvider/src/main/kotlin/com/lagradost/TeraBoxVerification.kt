@@ -393,12 +393,11 @@ object TeraBoxVerification {
                 if (!cookieStr.isNullOrBlank()) {
                     headers["Cookie"] = cookieStr
                 }
-                val payload = JSONObject().put("url", shareUrl).toString()
                 return runCatching {
                     app.post(
                         "$BASE_URL/api/proxy",
                         headers = headers,
-                        data = payload,
+                        json = mapOf("url" to shareUrl),
                         timeout = 10
                     ).text
                 }.getOrNull()
