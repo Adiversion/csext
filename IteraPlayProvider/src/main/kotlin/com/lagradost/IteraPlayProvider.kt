@@ -467,7 +467,7 @@ class IteraPlayProvider : MainAPI() {
                 reqBuilder.header("Accept", "*/*")
                 return@Interceptor chain.proceed(reqBuilder.build())
             }
-            if (url.contains("flowvideoplayer.com")) {
+            if (url.contains("flowvideoplayer.com") || url.contains("workers.dev")) {
                 val reqBuilder = request.newBuilder()
                 reqBuilder.header("User-Agent", TeraBoxExtractor.USER_AGENT)
                 reqBuilder.header("Referer", "https://flowvideoplayer.com/")
