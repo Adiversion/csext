@@ -267,6 +267,12 @@ open class TeraBoxExtractor : ExtractorApi() {
             }
         }
 
+        // In-memory caches to speed up repeated queries and folder parsing (10-min TTL)
+        private val shareContentsCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, TeraBoxFolderResult>>()
+        private val gidCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, String>>()
+        private val flowCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, FlowResolvedStream>>()
+        private const val CACHE_TTL_MS = 10 * 60 * 1000L // 10 minutes
+
         fun extractSurl(rawUrl: String): String? {
             val clean = rawUrl.trim()
             var surl = Regex("""(?:/s/|surl=)([a-zA-Z0-9_\-]+)""").find(clean)?.groupValues?.get(1)
@@ -281,6 +287,11 @@ open class TeraBoxExtractor : ExtractorApi() {
         suspend fun fetchShareContents(shareUrl: String): TeraBoxFolderResult? {
             return runCatching {
                 val surl = extractSurl(shareUrl) ?: return@runCatching null
+                val cached = shareContentsCache[surl]
+                val now = System.currentTimeMillis()
+                if (cached != null && (now - cached.first) < CACHE_TTL_MS) {
+                    return@runCatching cached.second
+                }
                 val ndus = getSavedNdus()
                 val candidateHosts = listOf("www.1024terabox.com", "1024tera.com", "terabox.app")
 
@@ -378,7 +389,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                     val resolvedTime = timestamp ?: rootRes?.serverTime?.toString() ?: rootRes?.timestamp?.toString()
                     val resolvedSign = sign ?: rootRes?.sign
 
-                    return@runCatching TeraBoxFolderResult(
+                    val folderRes = TeraBoxFolderResult(
                         title = rootRes?.title ?: initialFile?.serverFilename,
                         videos = videos,
                         uk = resolvedUk,
@@ -389,6 +400,8 @@ open class TeraBoxExtractor : ExtractorApi() {
                         host = host,
                         surl = surl
                     )
+                    shareContentsCache[surl] = System.currentTimeMillis() to folderRes
+                    return@runCatching folderRes
                 }
                 null
             }.getOrNull()
@@ -491,6 +504,13 @@ open class TeraBoxExtractor : ExtractorApi() {
             targetIndex: Int? = null
         ): FlowResolvedStream? {
             return runCatching {
+                val cacheKey = "${shareUrl}_${targetFsId}_${targetIndex}"
+                val cached = flowCache[cacheKey]
+                val now = System.currentTimeMillis()
+                if (cached != null && (now - cached.first) < CACHE_TTL_MS) {
+                    return@runCatching cached.second
+                }
+
                 val baseUrl = "https://flowvideoplayer.com"
                 val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
                 val secChUa = """"Chromium";v="148", "Google Chrome";v="148", "Not/A)Brand";v="99""""
@@ -629,12 +649,14 @@ open class TeraBoxExtractor : ExtractorApi() {
                     }
                 }
 
-                FlowResolvedStream(
+                val flowRes = FlowResolvedStream(
                     fileName = targetVid.fileName,
                     direct1080Url = direct1080Url,
                     fast720Url = targetVid.fastStreamUrl,
                     fileSize = targetVid.fileSize
                 )
+                flowCache[cacheKey] = System.currentTimeMillis() to flowRes
+                flowRes
             }.getOrNull()
         }
 
@@ -644,6 +666,12 @@ open class TeraBoxExtractor : ExtractorApi() {
             targetIndex: Int? = null
         ): String? {
             return runCatching {
+                val cacheKey = "${rawUrl}_${targetFsId}_${targetIndex}"
+                val cached = gidCache[cacheKey]
+                val now = System.currentTimeMillis()
+                if (cached != null && (now - cached.first) < CACHE_TTL_MS) {
+                    return@runCatching cached.second
+                }
                 val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
                 val tokenHeaders = mapOf(
                     "User-Agent" to userAgent,
@@ -690,6 +718,7 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                 val remoteHlsUrl = targetVid?.get("hlsStreamUrl")?.toString()
                 if (remoteHlsUrl.isNullOrBlank()) return@runCatching null
+                gidCache[cacheKey] = System.currentTimeMillis() to remoteHlsUrl
                 remoteHlsUrl
             }.getOrNull()
         }
@@ -713,62 +742,13 @@ open class TeraBoxExtractor : ExtractorApi() {
 
                     var emittedAny = false
 
-                    // 1. Emit FlowVideoPlayer Original 1080p/720p Direct Stream FIRST
-                    val flowStream = flowDeferred.await()
-                    if (!flowStream?.direct1080Url.isNullOrBlank()) {
-                        val fNameLower = flowStream.fileName?.lowercase() ?: ""
-                        val is4k = fNameLower.contains("4k") || fNameLower.contains("2160")
-                        val is720 = fNameLower.contains("720")
-                        val (qualityVal, qualityLabel) = when {
-                            is4k -> Qualities.P2160.value to "4K"
-                            is720 -> Qualities.P720.value to "720p"
-                            else -> Qualities.P1080.value to "1080p"
-                        }
-                        callback(
-                            newExtractorLink(
-                                source = "TeraBox Direct $qualityLabel",
-                                name = "TeraBox - Original [$qualityLabel] (Direct Stream)",
-                                url = flowStream.direct1080Url,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Accept" to "*/*",
-                                    "Referer" to "https://terabox.app/",
-                                    "Connection" to "keep-alive"
-                                )
-                                this.quality = qualityVal
-                            }
-                        )
-                        emittedAny = true
-                    }
-
-                    if (!flowStream?.fast720Url.isNullOrBlank()) {
-                        callback(
-                            newExtractorLink(
-                                source = "TeraBox Fast Stream",
-                                name = "TeraBox - Fast Stream [720p] (Flow Stream)",
-                                url = flowStream.fast720Url,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = "https://flowvideoplayer.com/"
-                                this.headers = mapOf(
-                                    "User-Agent" to USER_AGENT,
-                                    "Referer" to "https://flowvideoplayer.com/"
-                                )
-                                this.quality = Qualities.P720.value
-                            }
-                        )
-                        emittedAny = true
-                    }
-
-                    // 2. Emit GetInDevice Unthrottled HLS Stream (Accurately labeled 480p preview transcode)
+                    // 1. Emit GetInDevice Unthrottled HLS Stream FIRST (Smooth, instant seeking, zero buffer)
                     val gidHlsUrl = gidDeferred.await()
                     if (!gidHlsUrl.isNullOrBlank()) {
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Fast Stream ⚡",
-                                name = "TeraBox - Fast Stream ⚡ [480p] (Smooth Seek)",
+                                name = "TeraBox - Fast Stream ⚡ [480p] (Smooth Instant Playback)",
                                 url = gidHlsUrl,
                                 type = ExtractorLinkType.M3U8
                             ) {
@@ -778,6 +758,58 @@ open class TeraBoxExtractor : ExtractorApi() {
                                     "Referer" to "https://getindevice.com/"
                                 )
                                 this.quality = Qualities.P480.value
+                            }
+                        )
+                        emittedAny = true
+                    }
+
+                    // 2. Emit FlowVideoPlayer Fast Preview Stream (HLS preview transcode)
+                    val flowStream = flowDeferred.await()
+                    if (!flowStream?.fast720Url.isNullOrBlank()) {
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Fast Stream",
+                                name = "TeraBox - Fast Stream [480p] (Flow Worker)",
+                                url = flowStream.fast720Url,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://flowvideoplayer.com/"
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://flowvideoplayer.com/"
+                                )
+                                this.quality = Qualities.P480.value
+                            }
+                        )
+                        emittedAny = true
+                    }
+
+                    // 3. Emit FlowVideoPlayer Original File (Direct MKV proxied by worker ~150KB/s)
+                    // Set to Qualities.Unknown so CloudStream defaults to the fast unbuffered stream,
+                    // but leaves the genuine 1080p MKV selectable for downloads (1DM / ADM) or patient viewers.
+                    if (!flowStream?.direct1080Url.isNullOrBlank()) {
+                        val fNameLower = flowStream.fileName?.lowercase() ?: ""
+                        val is4k = fNameLower.contains("4k") || fNameLower.contains("2160")
+                        val is720 = fNameLower.contains("720")
+                        val qualityLabel = when {
+                            is4k -> "4K"
+                            is720 -> "720p"
+                            else -> "1080p"
+                        }
+                        callback(
+                            newExtractorLink(
+                                source = "TeraBox Direct $qualityLabel",
+                                name = "TeraBox - Original [$qualityLabel] (Worker Direct - ⚠️ Buffers @ 150KB/s)",
+                                url = flowStream.direct1080Url,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Accept" to "*/*",
+                                    "Referer" to "https://flowvideoplayer.com/",
+                                    "Connection" to "keep-alive"
+                                )
+                                this.quality = Qualities.Unknown.value
                             }
                         )
                         emittedAny = true
@@ -870,7 +902,7 @@ open class TeraBoxExtractor : ExtractorApi() {
                         callback(
                             newExtractorLink(
                                 source = "TeraBox Adaptive HD",
-                                name = "TeraBox - [Adaptive HD 1080p / 720p Master]",
+                                name = "TeraBox - [Adaptive HD 1080p / 720p Master (Paid VIP)]",
                                 url = masterUrl,
                                 type = ExtractorLinkType.M3U8
                             ) {

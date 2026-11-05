@@ -34,6 +34,10 @@ class IteraPlayProvider : MainAPI() {
         @Volatile var authCookie: String? = null
         @Volatile var appContext: Context? = null
 
+        // In-memory catalog cache (5-minute TTL) to avoid redundant network queries & Cloudflare rate-limits
+        private val catalogCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<SearchResponse>>>()
+        private const val CATALOG_CACHE_TTL_MS = 5 * 60 * 1000L
+
         fun getSavedCookie(context: Context? = null): String? {
             if (!authCookie.isNullOrBlank()) return authCookie
             val ctx = context ?: appContext ?: CommonActivity.activity ?: return null
@@ -59,10 +63,9 @@ class IteraPlayProvider : MainAPI() {
         }
     }
 
+    // Streamlined to 2 primary sections to eliminate Cloudflare 4-connection burst rate-limiting & TCP resets
     override val mainPage = mainPageOf(
         "trending" to "Trending",
-        "random"   to "For You",
-        "popular"  to "Popular",
         "recent"   to "Latest"
     )
 
@@ -71,25 +74,43 @@ class IteraPlayProvider : MainAPI() {
         val offset = (page - 1) * 20
         val effectiveSort = sort
 
+        val cacheKey = "main_${sort}_page_${page}"
+        val now = System.currentTimeMillis()
+        val cached = catalogCache[cacheKey]
+        if (cached != null && (now - cached.first) < CATALOG_CACHE_TTL_MS) {
+            return newHomePageResponse(request.name, cached.second)
+        }
+
         val cookie = getSavedCookie()
-        val (targetUrl, reqHeaders) = if (!cookie.isNullOrBlank()) {
-            "$mainUrl/api/home/search?q=&sort=$effectiveSort&limit=20&offset=$offset&quality=&duration=" to mapOf(
+        var resText: String? = null
+
+        // If remember_me cookie exists, attempt iteraplay.com with a short 3s timeout
+        if (!cookie.isNullOrBlank()) {
+            val iteraUrl = "$mainUrl/api/home/search?q=&sort=$effectiveSort&limit=20&offset=$offset&quality=&duration="
+            val iteraHeaders = mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer" to "$mainUrl/premium-videos",
                 "Cookie" to "remember_me=$cookie",
                 "Accept" to "application/json, text/plain, */*"
             )
-        } else {
-            "$altCatalogUrl/api/home/search?sort=$effectiveSort&offset=$offset&limit=20&quality=&duration=" to mapOf(
+            resText = runCatching { app.get(iteraUrl, headers = iteraHeaders, timeout = 3).text }.getOrNull()
+            if (resText != null && (resText.contains("Unauthorized") || resText.contains("401"))) {
+                resText = null
+            }
+        }
+
+        // Direct, fast route to alt catalog (teraviralhub) if iteraplay unauthenticated
+        if (resText.isNullOrBlank()) {
+            val altUrl = "$altCatalogUrl/api/home/search?sort=$effectiveSort&offset=$offset&limit=20&quality=&duration="
+            val altHeaders = mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer" to "$altCatalogUrl/",
                 "Accept" to "application/json, text/plain, */*"
             )
+            resText = runCatching { app.get(altUrl, headers = altHeaders, timeout = 8).text }.getOrNull()
         }
 
-        val resText = runCatching {
-            app.get(targetUrl, headers = reqHeaders, timeout = 10).text
-        }.getOrNull() ?: return newHomePageResponse(request.name, emptyList())
+        if (resText.isNullOrBlank()) return newHomePageResponse(request.name, emptyList())
 
         val encryptedObj = runCatching { parseJson<IteraEncryptedResponse>(resText) }.getOrNull()
         val encryptedData = encryptedObj?.data ?: return newHomePageResponse(request.name, emptyList())
@@ -97,6 +118,10 @@ class IteraPlayProvider : MainAPI() {
         val decryptedJson = IteraPlayCrypto.decrypt(encryptedData) ?: return newHomePageResponse(request.name, emptyList())
         val catalog = runCatching { parseJson<IteraDecryptedCatalog>(decryptedJson) }.getOrNull()
         val items = catalog?.list?.mapNotNull { it.toSearchResponse(mainUrl) } ?: emptyList()
+
+        if (items.isNotEmpty()) {
+            catalogCache[cacheKey] = now to items
+        }
 
         return newHomePageResponse(request.name, items)
     }
@@ -123,34 +148,55 @@ class IteraPlayProvider : MainAPI() {
         }
 
         // 2. Keyword Search on Catalog API:
+        val cacheKey = "search_${cleanQuery.lowercase()}"
+        val now = System.currentTimeMillis()
+        val cached = catalogCache[cacheKey]
+        if (cached != null && (now - cached.first) < CATALOG_CACHE_TTL_MS) {
+            return cached.second
+        }
+
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
         val cookie = getSavedCookie()
-        val (targetUrl, reqHeaders) = if (!cookie.isNullOrBlank()) {
-            "$mainUrl/api/home/search?q=$encodedQuery&sort=&limit=25&offset=0" to mapOf(
+        var resText: String? = null
+
+        if (!cookie.isNullOrBlank()) {
+            val iteraUrl = "$mainUrl/api/home/search?q=$encodedQuery&sort=&limit=25&offset=0"
+            val iteraHeaders = mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer" to "$mainUrl/",
                 "Cookie" to "remember_me=$cookie",
                 "Accept" to "application/json, text/plain, */*"
             )
-        } else {
-            "$altCatalogUrl/api/home/search?q=$encodedQuery&sort=&limit=25&offset=0" to mapOf(
+            resText = runCatching { app.get(iteraUrl, headers = iteraHeaders, timeout = 3).text }.getOrNull()
+            if (resText != null && (resText.contains("Unauthorized") || resText.contains("401"))) {
+                resText = null
+            }
+        }
+
+        if (resText.isNullOrBlank()) {
+            val altUrl = "$altCatalogUrl/api/home/search?q=$encodedQuery&sort=&limit=25&offset=0"
+            val altHeaders = mapOf(
                 "User-Agent" to USER_AGENT,
                 "Referer" to "$altCatalogUrl/",
                 "Accept" to "application/json, text/plain, */*"
             )
+            resText = runCatching { app.get(altUrl, headers = altHeaders, timeout = 8).text }.getOrNull()
         }
 
-        val resText = runCatching {
-            app.get(targetUrl, headers = reqHeaders, timeout = 10).text
-        }.getOrNull() ?: return emptyList()
+        if (resText.isNullOrBlank()) return emptyList()
 
         val encryptedObj = runCatching { parseJson<IteraEncryptedResponse>(resText) }.getOrNull()
         val encryptedData = encryptedObj?.data ?: return emptyList()
 
         val decryptedJson = IteraPlayCrypto.decrypt(encryptedData) ?: return emptyList()
         val catalog = runCatching { parseJson<IteraDecryptedCatalog>(decryptedJson) }.getOrNull()
+        val items = catalog?.list?.mapNotNull { it.toSearchResponse(mainUrl) } ?: emptyList()
 
-        return catalog?.list?.mapNotNull { it.toSearchResponse(mainUrl) } ?: emptyList()
+        if (items.isNotEmpty()) {
+            catalogCache[cacheKey] = now to items
+        }
+
+        return items
     }
 
     override suspend fun load(url: String): LoadResponse {
