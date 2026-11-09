@@ -64,10 +64,15 @@ object TeraBoxVerification {
         }
     }
 
+    fun getCookieExp(cookieStr: String?): Long {
+        if (cookieStr.isNullOrBlank()) return 0L
+        val expMatch = Regex("""(?:^|;\s*)tdl_pass_exp=(\d+)""").find(cookieStr) ?: return 0L
+        return expMatch.groupValues.getOrNull(1)?.toLongOrNull() ?: 0L
+    }
+
     fun isCookieExpValid(cookieStr: String?): Boolean {
-        if (cookieStr.isNullOrBlank()) return false
-        val expMatch = Regex("""(?:^|;\s*)tdl_pass_exp=(\d+)""").find(cookieStr) ?: return false
-        val expVal = expMatch.groupValues.getOrNull(1)?.toLongOrNull() ?: return false
+        val expVal = getCookieExp(cookieStr)
+        if (expVal <= 0L) return false
         val nowSec = System.currentTimeMillis() / 1000L
         return (expVal - nowSec) > 60L
     }
@@ -79,6 +84,30 @@ object TeraBoxVerification {
         val exp = cachedExpSeconds
         val now = System.currentTimeMillis() / 1000L
         return !cachedCookies.isNullOrBlank() && (exp - now > 60L)
+    }
+
+    fun clearSession(context: Context? = null) {
+        cachedCookies = null
+        cachedExpSeconds = 0L
+        cachedFetchedItems = null
+        val ctx = context ?: CommonActivity.activity ?: getActivity()
+        ctx?.let {
+            runCatching {
+                it.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .clear()
+                    .commit()
+            }
+        }
+        runCatching {
+            val cm = CookieManager.getInstance()
+            cm.setCookie("https://1024teradl.com", "tdl_pass=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/")
+            cm.setCookie("https://1024teradl.com", "tdl_pass_exp=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/")
+            cm.setCookie("https://1024teradl.com/", "tdl_pass=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/")
+            cm.setCookie("https://1024teradl.com/", "tdl_pass_exp=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/")
+            cm.flush()
+        }
+        Log.d(TAG, "Cleared stale Turnstile session from cache and CookieManager")
     }
 
     fun loadSavedSession(context: Context? = null) {
@@ -162,13 +191,16 @@ object TeraBoxVerification {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    fun solveTurnstile(targetTeraUrl: String? = null): Boolean {
+    fun solveTurnstile(targetTeraUrl: String? = null, force: Boolean = false): Boolean {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             Log.e(TAG, "solveTurnstile must not be called from the main thread")
             return false
         }
-        if (isTokenValid()) {
+        if (!force && isTokenValid()) {
             return true
+        }
+        if (force) {
+            clearSession()
         }
         val activity = CommonActivity.activity ?: getActivity()
         if (activity == null || activity.isFinishing || activity.isDestroyed) {
@@ -192,6 +224,7 @@ object TeraBoxVerification {
 
         val latch = CountDownLatch(1)
         var success = false
+        val initialExp = cachedExpSeconds
 
         activity.runOnUiThread {
             try {
@@ -330,8 +363,7 @@ object TeraBoxVerification {
                         .distinct()
                         .joinToString("; ")
 
-                    val expMatch = Regex("""tdl_pass_exp=(\d+)""").find(mergedCookies)
-                    val expVal = expMatch?.groupValues?.get(1)?.toLongOrNull()
+                    val expVal = getCookieExp(mergedCookies).takeIf { it > 0L }
                         ?: (System.currentTimeMillis() / 1000L + 86400L)
 
                     saveSession(activity, mergedCookies, expVal)
@@ -378,15 +410,19 @@ object TeraBoxVerification {
                     val cm1 = cookieManager.getCookie("https://1024teradl.com/") ?: ""
                     val cm2 = cookieManager.getCookie("https://1024teradl.com") ?: ""
                     val combined = "$cm1; $cm2"
+                    val combinedExp = getCookieExp(combined)
 
-                    if (isCookieExpValid(combined)) {
+                    val isNewValidExp = combinedExp > (System.currentTimeMillis() / 1000L + 60L) &&
+                            (initialExp == 0L || combinedExp != initialExp)
+
+                    if (isNewValidExp) {
                         if (cachedFetchedItems.isNullOrEmpty() && !targetTeraUrl.isNullOrBlank() && verifiedTimeMs == 0L) {
                             verifiedTimeMs = System.currentTimeMillis()
-                            Log.d(TAG, "Detected valid tdl_pass_exp via CookieManager poll, waiting for in-page /api/proxy fetch...")
+                            Log.d(TAG, "Detected new tdl_pass_exp via CookieManager poll, waiting for in-page /api/proxy fetch...")
                         }
 
                         val waitedAfterVerify = if (verifiedTimeMs > 0L) System.currentTimeMillis() - verifiedTimeMs else 0L
-                        if (!cachedFetchedItems.isNullOrEmpty() || waitedAfterVerify >= 4000L || targetTeraUrl.isNullOrBlank()) {
+                        if (!cachedFetchedItems.isNullOrEmpty() || waitedAfterVerify >= 25000L || targetTeraUrl.isNullOrBlank()) {
                             Log.d(TAG, "Turnstile verified via CookieManager poll! itemsReady=${!cachedFetchedItems.isNullOrEmpty()}")
                             finishWithVerification(combined, null)
                             return@Runnable
@@ -395,14 +431,18 @@ object TeraBoxVerification {
 
                     webView.evaluateJavascript("(function(){ return document.cookie || ''; })()") { jsVal ->
                         val cleaned = jsVal?.replace("\"", "")?.trim() ?: ""
-                        if (isCookieExpValid(cleaned)) {
+                        val jsExp = getCookieExp(cleaned)
+                        val isNewJsValidExp = jsExp > (System.currentTimeMillis() / 1000L + 60L) &&
+                                (initialExp == 0L || jsExp != initialExp)
+
+                        if (isNewJsValidExp) {
                             if (cachedFetchedItems.isNullOrEmpty() && !targetTeraUrl.isNullOrBlank() && verifiedTimeMs == 0L) {
                                 verifiedTimeMs = System.currentTimeMillis()
-                                Log.d(TAG, "Detected valid tdl_pass_exp via document.cookie poll, waiting for in-page /api/proxy fetch...")
+                                Log.d(TAG, "Detected new tdl_pass_exp via document.cookie poll, waiting for in-page /api/proxy fetch...")
                             }
 
                             val waitedAfterVerify = if (verifiedTimeMs > 0L) System.currentTimeMillis() - verifiedTimeMs else 0L
-                            if (!cachedFetchedItems.isNullOrEmpty() || waitedAfterVerify >= 4000L || targetTeraUrl.isNullOrBlank()) {
+                            if (!cachedFetchedItems.isNullOrEmpty() || waitedAfterVerify >= 25000L || targetTeraUrl.isNullOrBlank()) {
                                 Log.d(TAG, "Turnstile verified via document.cookie poll! itemsReady=${!cachedFetchedItems.isNullOrEmpty()}")
                                 finishWithVerification(cleaned, null)
                             }
@@ -476,12 +516,33 @@ object TeraBoxVerification {
                                     return p;
                                 };
 
+                                // Hook XMLHttpRequest as well
+                                try {
+                                    var _origOpen = XMLHttpRequest.prototype.open;
+                                    var _origSend = XMLHttpRequest.prototype.send;
+                                    XMLHttpRequest.prototype.open = function(method, url) {
+                                        this._url = url;
+                                        return _origOpen.apply(this, arguments);
+                                    };
+                                    XMLHttpRequest.prototype.send = function() {
+                                        if (this._url && typeof this._url === 'string' && this._url.indexOf('/api/proxy') !== -1) {
+                                            this.addEventListener('load', function() {
+                                                if (this.responseText && this.responseText.indexOf('list') !== -1) {
+                                                    notifyAndroid(this.responseText);
+                                                }
+                                            });
+                                        }
+                                        return _origSend.apply(this, arguments);
+                                    };
+                                } catch(e) {}
+
                                 function handleTokenSuccess(token) {
                                     var statusDiv = document.getElementById('__tb_status');
                                     if (statusDiv) statusDiv.innerText = 'Token verified! Unlocking 1080p stream...';
 
                                     fetch('/api/verify', {
                                         method: 'POST',
+                                        credentials: 'include',
                                         headers: { 'Content-Type': 'application/json' },
                                         body: JSON.stringify({ token: token })
                                     }).then(function(r) {
@@ -493,6 +554,7 @@ object TeraBoxVerification {
                                         if (targetUrl && targetUrl.length > 5) {
                                             fetch('/api/proxy', {
                                                 method: 'POST',
+                                                credentials: 'include',
                                                 headers: { 'Content-Type': 'application/json' },
                                                 body: JSON.stringify({ url: targetUrl })
                                             }).then(function(pr) {
@@ -614,7 +676,8 @@ object TeraBoxVerification {
                         val cm1 = cookieManager.getCookie("https://1024teradl.com/") ?: ""
                         val cm2 = cookieManager.getCookie("https://1024teradl.com") ?: ""
                         val finalCookies = "$cm1; $cm2"
-                        if (isCookieExpValid(finalCookies)) {
+                        val finalExp = getCookieExp(finalCookies)
+                        if (finalExp > (System.currentTimeMillis() / 1000L + 60L) && (initialExp == 0L || finalExp != initialExp)) {
                             finishWithVerification(finalCookies, null)
                         } else {
                             latch.countDown()
@@ -657,7 +720,7 @@ object TeraBoxVerification {
                 loadSavedSession()
             }
 
-            suspend fun doRequest(cookieStr: String?): String? {
+            suspend fun doRequest(cookieStr: String?): Pair<Int, String?> {
                 val headers = mutableMapOf(
                     "User-Agent" to TeraBoxExtractor.USER_AGENT,
                     "Content-Type" to "application/json",
@@ -676,22 +739,30 @@ object TeraBoxVerification {
                         timeout = 15
                     )
                     Log.d(TAG, "doRequest status=${res.code}")
-                    res.text
-                }.onFailure {
+                    Pair(res.code, res.text)
+                }.getOrElse {
                     Log.w(TAG, "doRequest network failure: ${it.message}")
-                }.getOrNull()
+                    Pair(0, null)
+                }
             }
 
-            var responseText = doRequest(cachedCookies)
+            var (statusCode, responseText) = if (!cachedCookies.isNullOrBlank()) {
+                doRequest(cachedCookies)
+            } else {
+                Pair(0, null)
+            }
 
-            val isChallengeRequired = responseText == null ||
+            val isChallengeRequired = statusCode == 403 ||
+                    statusCode == 401 ||
+                    responseText == null ||
                     responseText.contains("CHALLENGE_REQUIRED") ||
                     responseText.contains("Verification required")
 
             if (isChallengeRequired && allowVerification) {
-                val solved = solveTurnstile(shareUrl)
+                Log.d(TAG, "Challenge required by 1024teradl (status=$statusCode), forcing Turnstile resolution...")
+                val solved = solveTurnstile(shareUrl, force = true)
                 var waitCount = 0
-                while (cachedFetchedItems.isNullOrEmpty() && waitCount < 8 && isDialogShowing.get()) {
+                while (cachedFetchedItems.isNullOrEmpty() && waitCount < 20 && isDialogShowing.get()) {
                     try { kotlinx.coroutines.delay(250L) } catch (_: Exception) { break }
                     waitCount++
                 }
@@ -702,7 +773,8 @@ object TeraBoxVerification {
                     return@runCatching items
                 }
                 if (solved && !cachedCookies.isNullOrBlank()) {
-                    responseText = doRequest(cachedCookies)
+                    val retry = doRequest(cachedCookies)
+                    responseText = retry.second
                 }
             }
 
