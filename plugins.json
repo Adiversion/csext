@@ -23,10 +23,10 @@
     },
     {
         "iconUrl": "https://raw.githubusercontent.com/Adiversion/csext/builds/IteraPlay_icon.png",
-        "fileHash": "sha256-a635ec51cc41bcbe96feab13c11205ec2fe35d32d5299cfec18f2ecaa8935987",
+        "fileHash": "sha256-0e3d8969f4252c00f3094db0a4c370b0d2da0d2b8ac75bbf74ccb764362ca13f",
         "apiVersion": 1,
         "repositoryUrl": "https://github.com/Adiversion/csext",
-        "fileSize": 127346,
+        "fileSize": 129020,
         "status": 1,
         "language": "en",
         "authors": [
