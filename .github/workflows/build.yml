@@ -53,7 +53,7 @@ jobs:
           chmod +x gradlew
           
           # Warmup JitPack maven metadata
-          curl -s -L -f "https://jitpack.io/com/github/recloudstream/gradle/-SNAPSHOT/gradle--SNAPSHOT.pom" -o /dev/null || true
+          curl -s -L -f "https://jitpack.io/com/github/recloudstream/gradle/-32895aedb6-1/gradle--32895aedb6-1.pom" -o /dev/null || true
           
           set +e
           BUILD_STATUS=1
