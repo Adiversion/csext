@@ -1296,9 +1296,9 @@ class WaveFlixProvider : MainAPI() {
                     if (isMovie) {
                         for (a in postDoc.select("a[href]")) {
                             val href = a.attr("href").trim()
-                            if (href.contains("greenmotors.") || href.contains("hubdrive.") ||
-                                href.contains("hubcloud.") || href.contains("hblinks.") ||
-                                href.contains("katdrive.") || href.contains("fastdl.")) {
+                            if (href.contains("greenmotors") || href.contains("hubdrive") ||
+                                href.contains("hubcloud") || href.contains("hblinks") ||
+                                href.contains("katdrive") || href.contains("fastdl")) {
 
                                 val precedingText = a.parents().firstOrNull { p ->
                                     val t = p.text()
@@ -1361,9 +1361,9 @@ class WaveFlixProvider : MainAPI() {
 
                                 for (a in item.select("a[href]")) {
                                     val href = a.attr("href").trim()
-                                    if (href.contains("greenmotors.") || href.contains("hubdrive.") ||
-                                        href.contains("hubcloud.") || href.contains("hblinks.") ||
-                                        href.contains("katdrive.") || href.contains("fastdl.")) {
+                                    if (href.contains("greenmotors") || href.contains("hubdrive") ||
+                                        href.contains("hubcloud") || href.contains("hblinks") ||
+                                        href.contains("katdrive") || href.contains("fastdl")) {
                                         val taggedUrl = if (tagBuilder.isNotEmpty() && !href.contains("#")) "$href$tagBuilder" else href
                                         runCatching {
                                             loadExtractor(taggedUrl, postUrl, subtitleCallback, callback)
@@ -1398,21 +1398,29 @@ class WaveFlixProvider : MainAPI() {
         )
 
         val cleanQuery = query.replace(Regex("""[^a-zA-Z0-9\s]"""), " ").trim()
-        val searchUrl = if (!imdbId.isNullOrBlank()) {
-            "https://search.pingora.fyi/collections/post/documents/search?q=$imdbId&query_by=post_title%2Ccategory%2Cstars%2Cdirector%2Cimdb_id&query_by_weights=4%2C2%2C2%2C2%2C4&sort_by=sort_by_date%3Adesc&limit=15&highlight_fields=none&use_cache=true&page=1"
-        } else {
-            "$base/?s=${cleanQuery.replace(" ", "+")}"
+        var searchRes: NiceResponse? = null
+        if (!imdbId.isNullOrBlank()) {
+            val pingoraUrl = "https://search.pingora.fyi/collections/post/documents/search?q=$imdbId&query_by=post_title%2Ccategory%2Cstars%2Cdirector%2Cimdb_id&query_by_weights=4%2C2%2C2%2C2%2C4&sort_by=sort_by_date%3Adesc&limit=15&highlight_fields=none&use_cache=true&page=1"
+            searchRes = runCatching {
+                val res = app.get(pingoraUrl, headers = hdhubHeaders, timeout = 6)
+                if (res.code in 200..299 && !res.text.contains("Forbidden")) res else null
+            }.getOrNull()
         }
 
-        val searchRes = runCatching {
-            app.get(searchUrl, headers = hdhubHeaders, timeout = 8)
-        }.getOrNull() ?: return@coroutineScope
+        if (searchRes == null) {
+            val fallbackSearchUrl = "$base/?s=${cleanQuery.replace(" ", "+")}"
+            searchRes = runCatching {
+                app.get(fallbackSearchUrl, headers = hdhubHeaders, timeout = 8)
+            }.getOrNull()
+        }
+
+        if (searchRes == null) return@coroutineScope
         DomainResolver.reportRedirect("hdhub4u", searchRes.url)
         val searchBody = searchRes.text
 
         val posts = mutableListOf<Pair<String, String>>() // (url, title)
 
-        if (searchUrl.contains("pingora.fyi")) {
+        if (searchRes.url.contains("pingora.fyi")) {
             val pingoraObj = runCatching { parseJson<RogSearchResponse>(searchBody) }.getOrNull()
             pingoraObj?.hits?.forEach { hit ->
                 val permalink = hit.document?.permalink ?: return@forEach
@@ -1424,10 +1432,10 @@ class WaveFlixProvider : MainAPI() {
 
         if (posts.isEmpty()) {
             val doc = Jsoup.parse(searchBody)
-            doc.select("li.thumb").forEach { thumb ->
-                val a = thumb.selectFirst("figure a, figcaption a")
+            doc.select("li.thumb, li[class*='thumb'], article").forEach { thumb ->
+                val a = thumb.selectFirst("figure a, figcaption a, a")
                 val href = a?.attr("href")?.trim() ?: return@forEach
-                val title = a.attr("aria-label").ifBlank { thumb.selectFirst("figcaption p")?.text() ?: "" }.trim()
+                val title = a.attr("aria-label").ifBlank { thumb.selectFirst("figcaption p, h2, h3")?.text() ?: "" }.trim()
                 if (href.isNotBlank() && title.isNotBlank()) {
                     val fullUrl = if (href.startsWith("http")) href else "$base" + (if (href.startsWith("/")) href else "/$href")
                     posts.add(fullUrl to title)
@@ -1624,22 +1632,29 @@ class WaveFlixProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ) {
         val base = DomainResolver.get("moviesdrive")
-        val searchUrl = if (!imdbId.isNullOrBlank()) {
-            "$base/search.php?q=$imdbId"
-        } else {
-            "$base/search.php?q=${URLEncoder.encode(query, "UTF-8")}"
-        }
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Referer" to "$base/"
         )
-        val jsonResponse = runCatching {
-            app.get(searchUrl, headers = headers, timeout = 7)
-        }.getOrNull() ?: return
-        DomainResolver.reportRedirect("moviesdrive", jsonResponse.url)
-        val jsonRes = jsonResponse.text
-        val data = runCatching { parseJson<RogSearchResponse>(jsonRes) }.getOrNull() ?: return
-        val hits = data.hits ?: return
+        val searchUrls = mutableListOf<String>()
+        if (!imdbId.isNullOrBlank()) {
+            searchUrls.add("$base/search.php?q=$imdbId")
+        }
+        searchUrls.add("$base/search.php?q=${URLEncoder.encode(query, "UTF-8")}")
+
+        var hits: List<RogSearchHit>? = null
+        for (url in searchUrls) {
+            val jsonResponse = runCatching {
+                app.get(url, headers = headers, timeout = 7)
+            }.getOrNull() ?: continue
+            DomainResolver.reportRedirect("moviesdrive", jsonResponse.url)
+            val data = runCatching { parseJson<RogSearchResponse>(jsonResponse.text) }.getOrNull()
+            if (!data?.hits.isNullOrEmpty()) {
+                hits = data?.hits
+                break
+            }
+        }
+        if (hits.isNullOrEmpty()) return
 
         for (hit in hits) {
             val doc = hit.document ?: continue
@@ -1933,7 +1948,7 @@ class WaveFlixProvider : MainAPI() {
         }.getOrNull() ?: return
 
         val postDoc = org.jsoup.Jsoup.parse(postHtml)
-        postDoc.select("a[href*='fastdl.'], a[href*='hubcloud.'], a[href*='vcloud.'], a[href*='gofile.'], a[href*='pixeldrain.']").forEach { a ->
+        postDoc.select("a[href*='fastdl'], a[href*='hubcloud'], a[href*='vcloud'], a[href*='gofile'], a[href*='pixeldrain']").forEach { a ->
             val href = a.attr("href").trim()
             val text = (a.text() + " " + a.parent()?.text().orEmpty()).lowercase()
             if (!isMovie) {
@@ -2061,7 +2076,7 @@ class WaveFlixProvider : MainAPI() {
                 }
             }
 
-            doc.select("a[href*='vcloud.'], a[href*='hubcloud.'], a[href*='fastdl.'], a[href*='fast-dl.'], a[href*='zee-dl.']").forEach { a ->
+            doc.select("a[href*='vcloud'], a[href*='hubcloud'], a[href*='fastdl'], a[href*='fast-dl'], a[href*='zee-dl']").forEach { a ->
                 val href = a.attr("href").trim()
                 val btnText = a.text().trim()
                 if (!isMovie) {
@@ -2110,7 +2125,7 @@ class WaveFlixProvider : MainAPI() {
                                 if (nextEl != null) {
                                     nextEl.select("a[href]").forEach { subA ->
                                         val sHref = subA.attr("href").trim()
-                                        if (sHref.contains("fastdl.") || sHref.contains("vcloud.") || sHref.contains("hubcloud.") || sHref.contains("fast-dl.")) {
+                                        if (sHref.contains("fastdl") || sHref.contains("vcloud") || sHref.contains("hubcloud") || sHref.contains("fast-dl")) {
                                             candidateLinks.add(sHref)
                                         }
                                     }
@@ -2118,13 +2133,13 @@ class WaveFlixProvider : MainAPI() {
                             }
                         }
                     } else {
-                        nexDoc.select("a[href*='vcloud.'], a[href*='hubcloud.'], a[href*='fastdl.'], a[href*='fast-dl.']").forEach { subA ->
+                        nexDoc.select("a[href*='vcloud'], a[href*='hubcloud'], a[href*='fastdl'], a[href*='fast-dl']").forEach { subA ->
                             candidateLinks.add(subA.attr("href").trim())
                         }
                     }
 
                     if (candidateLinks.isEmpty()) {
-                        val allLinks = nexDoc.select("a[href*='vcloud.'], a[href*='hubcloud.'], a[href*='fastdl.'], a[href*='fast-dl.']")
+                        val allLinks = nexDoc.select("a[href*='vcloud'], a[href*='hubcloud'], a[href*='fastdl'], a[href*='fast-dl']")
                             .map { it.attr("href").trim() }
                         if (!isMovie && episode in 1..allLinks.size) {
                             candidateLinks.add(allLinks[episode - 1])
@@ -2655,7 +2670,11 @@ class WaveFlixProvider : MainAPI() {
 
     // Nxsha AES-256-CBC Crypto Implementation (OpenSSL EVP_BytesToKey)
     object NxshaCrypto {
-        private const val KEY = "f4488ab4da401203d23baa129fc546153898162524635d6776826d0c867ccaa3"
+        private const val PRIMARY_KEY = "38c8cd65d781936f4b9fe1fd985234fd7335699855051abf76ea3493bcfc0120"
+        private val KEYS = listOf(
+            "38c8cd65d781936f4b9fe1fd985234fd7335699855051abf76ea3493bcfc0120",
+            "f4488ab4da401203d23baa129fc546153898162524635d6776826d0c867ccaa3"
+        )
 
         private fun b64Encode(bytes: ByteArray): String {
             return try {
@@ -2712,7 +2731,7 @@ class WaveFlixProvider : MainAPI() {
             val salt = ByteArray(8)
             SecureRandom().nextBytes(salt)
 
-            val (key, iv) = evpBytesToKey(KEY.toByteArray(Charsets.UTF_8), salt)
+            val (key, iv) = evpBytesToKey(PRIMARY_KEY.toByteArray(Charsets.UTF_8), salt)
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             val encrypted = cipher.doFinal(payload.toByteArray(Charsets.UTF_8))
@@ -2728,27 +2747,29 @@ class WaveFlixProvider : MainAPI() {
         }
 
         fun decrypt(encryptedBase64Url: String): String? {
-            return try {
-                var b64 = encryptedBase64Url.replace('-', '+').replace('_', '/')
-                val remainder = b64.length % 4
-                if (remainder != 0) {
-                    b64 += "=".repeat(4 - remainder)
-                }
-                val raw = b64Decode(b64)
-                if (raw.size < 16) return null
-                val header = String(raw.copyOfRange(0, 8), Charsets.UTF_8)
-                if (header != "Salted__") return null
-                val salt = raw.copyOfRange(8, 16)
-                val ciphertext = raw.copyOfRange(16, raw.size)
-
-                val (key, iv) = evpBytesToKey(KEY.toByteArray(Charsets.UTF_8), salt)
-                val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-                val decryptedBytes = cipher.doFinal(ciphertext)
-                String(decryptedBytes, Charsets.UTF_8)
-            } catch (_: Throwable) {
-                null
+            var b64 = encryptedBase64Url.replace('-', '+').replace('_', '/')
+            val remainder = b64.length % 4
+            if (remainder != 0) {
+                b64 += "=".repeat(4 - remainder)
             }
+            val raw = try { b64Decode(b64) } catch (_: Throwable) { return null }
+            if (raw.size < 16) return null
+            val header = String(raw.copyOfRange(0, 8), Charsets.UTF_8)
+            if (header != "Salted__") return null
+            val salt = raw.copyOfRange(8, 16)
+            val ciphertext = raw.copyOfRange(16, raw.size)
+
+            for (k in KEYS) {
+                val res = runCatching {
+                    val (key, iv) = evpBytesToKey(k.toByteArray(Charsets.UTF_8), salt)
+                    val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                    val decryptedBytes = cipher.doFinal(ciphertext)
+                    String(decryptedBytes, Charsets.UTF_8)
+                }.getOrNull()
+                if (!res.isNullOrBlank()) return res
+            }
+            return null
         }
     }
 }
